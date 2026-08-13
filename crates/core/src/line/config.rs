@@ -20,6 +20,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::BridgeConfig;
+
 /// Default server when `server_url` isn't set explicitly. Override
 /// in dev via `THCLAWS_LINE_SERVER`.
 pub const DEFAULT_SERVER_URL: &str = "https://line.thclaws.ai";
@@ -174,59 +176,10 @@ impl LineConfig {
         }
     }
 
-    /// Resolve the relay URL for this binding. Precedence: explicit
-    /// `server_url` in the saved config → `THCLAWS_LINE_SERVER` env
-    /// → `DEFAULT_SERVER_URL`.
-    pub fn resolved_server_url(&self) -> String {
-        if let Some(url) = self.server_url.as_deref() {
-            return url.trim_end_matches('/').to_string();
-        }
-        if let Ok(url) = std::env::var("THCLAWS_LINE_SERVER") {
-            if !url.trim().is_empty() {
-                return url.trim_end_matches('/').to_string();
-            }
-        }
-        DEFAULT_SERVER_URL.to_string()
-    }
-
-    /// Build the `wss://…/ws?token=<jwt>` URL the WS client opens.
-    pub fn ws_url(&self) -> String {
-        let base = self.resolved_server_url();
-        let scheme = if base.starts_with("http://") {
-            "ws://"
-        } else {
-            "wss://"
-        };
-        let host = base
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        format!(
-            "{scheme}{host}/ws?token={}",
-            urlencoding::encode(&self.binding_token)
-        )
-    }
-
-    /// Build the absolute `POST /reply/<request_id>` URL.
-    pub fn reply_url(&self, request_id: &str) -> String {
-        format!(
-            "{}/reply/{}",
-            self.resolved_server_url(),
-            urlencoding::encode(request_id)
-        )
-    }
-
-    /// Build the absolute `POST /unpair` URL.
-    pub fn unpair_url(&self) -> String {
-        format!("{}/unpair", self.resolved_server_url())
-    }
-
-    /// Build the absolute `POST /push` URL. Used for unsolicited
-    /// messages from thClaws — approval prompts, timeout notices.
-    /// `/reply/:id` is the wrong primitive for these because there's
-    /// no inbound webhook event to provide a `replyToken`.
-    pub fn push_url(&self) -> String {
-        format!("{}/push", self.resolved_server_url())
-    }
+    // `resolved_server_url` / `ws_url` / `reply_url` / `push_url` /
+    // `unpair_url` now come from the shared `BridgeConfig` trait
+    // (dev-plan/44 Tier 0) — see the `impl BridgeConfig for LineConfig`
+    // below. LINE-only routes (chat-bridge) stay here.
 
     /// Build the absolute `POST /chat-bridge/event` URL. Used to
     /// fan out per-turn `ViewEvent`s (assistant text deltas, tool
@@ -245,9 +198,27 @@ impl LineConfig {
     }
 }
 
+impl BridgeConfig for LineConfig {
+    fn binding_token(&self) -> &str {
+        &self.binding_token
+    }
+    fn server_url_override(&self) -> Option<&str> {
+        self.server_url.as_deref()
+    }
+    fn server_env_var(&self) -> &'static str {
+        "THCLAWS_LINE_SERVER"
+    }
+    fn default_server(&self) -> &'static str {
+        DEFAULT_SERVER_URL
+    }
+    // route_prefix defaults to "" — LINE's outbound routes are
+    // `/reply`, `/push` (no channel namespace).
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::BridgeConfig;
 
     #[test]
     fn server_url_precedence_config_over_env_over_default() {

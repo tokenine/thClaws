@@ -101,15 +101,48 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "revision": revision,
         })
         .to_string()],
+        ViewEvent::TurnUsage(text) => vec![serde_json::json!({
+            "type": "chat_turn_usage",
+            "text": strip_ansi(text),
+        })
+        .to_string()],
         ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
+        ViewEvent::BusyChanged => {
+            // Snapshot busy state inline so subscribers don't need a
+            // follow-up `gui_busy_query` round-trip. Time is emitted
+            // as milliseconds-since-epoch — the frontend converts to
+            // a relative "Xm Ys" elapsed for the chip label.
+            let meta = crate::agent_activity::busy_meta();
+            let started_at_ms = meta.as_ref().and_then(|m| {
+                m.started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+            });
+            vec![serde_json::json!({
+                "type": "gui_busy_changed",
+                "busy": meta.is_some(),
+                "sessionId": meta.as_ref().map(|m| m.session_id.clone()),
+                "startedAtMs": started_at_ms,
+                "lastProgress": meta.as_ref().and_then(|m| m.last_progress.clone()),
+            })
+            .to_string()]
+        }
         ViewEvent::HistoryReplaced(messages) => {
             let arr: Vec<serde_json::Value> = messages
                 .iter()
                 .map(|m| {
-                    serde_json::json!({
+                    // `thinking` is omitted rather than null when the
+                    // turn had none, so the frontend's `msg.thinking`
+                    // check stays a plain truthiness test.
+                    let mut row = serde_json::json!({
                         "role": m.role,
                         "content": strip_ansi(&m.content),
-                    })
+                    });
+                    if let Some(t) = &m.thinking {
+                        row["thinking"] = serde_json::json!(strip_ansi(t));
+                    }
+                    row
                 })
                 .collect();
             vec![serde_json::json!({
@@ -120,6 +153,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         }
         ViewEvent::SessionListRefresh(json) => vec![json.clone()],
         ViewEvent::ProviderUpdate(json) => vec![json.clone()],
+        ViewEvent::SettingsChanged(json) => vec![json.clone()],
         ViewEvent::KmsUpdate(json) => vec![json.clone()],
         ViewEvent::McpUpdate(json) => vec![json.clone()],
         ViewEvent::LineStatus(json) => vec![json.clone()],
@@ -128,6 +162,8 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         ViewEvent::ResearchUpdate(json) => vec![json.clone()],
         ViewEvent::ModelPickerOpen(json) => vec![json.clone()],
         ViewEvent::ScheduleAddOpen(json) => vec![json.clone()],
+        ViewEvent::AgentEditorOpen(json) => vec![json.clone()],
+        ViewEvent::MarketplaceOpen(json) => vec![json.clone()],
         ViewEvent::ContextWarning { file_size_mb } => vec![serde_json::json!({
             "type": "chat_context_warning",
             "file_size_mb": file_size_mb,
@@ -164,6 +200,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         // function is called — see the early-return in
         // `gui::spawn_event_translator` / the equivalent web hook.
         ViewEvent::QuitRequested => vec![],
+        ViewEvent::ReloadRequested => vec![],
         ViewEvent::PlanUpdate(plan) => {
             let payload = serde_json::json!({
                 "type": "chat_plan_update",
@@ -310,6 +347,19 @@ pub fn render_gui_shell_dispatch(ev: &ViewEvent) -> Option<String> {
             })
             .to_string(),
         ),
+        // Per-turn cost/latency. Already rendered for the Terminal and
+        // Chat tabs; shells never saw it, so a chat shell could not tell
+        // the user what a turn cost — which matters most on cloud, where
+        // it's their credits. Ships the same preformatted line the other
+        // surfaces show.
+        ViewEvent::TurnUsage(text) => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "usage",
+                "payload": { "text": strip_ansi(text) },
+            })
+            .to_string(),
+        ),
         ViewEvent::ErrorText(s) => Some(
             serde_json::json!({
                 "type": "gui_shell_event",
@@ -344,8 +394,51 @@ pub fn render_gui_shell_dispatch(ev: &ViewEvent) -> Option<String> {
             })
             .to_string(),
         ),
+        // Output of a `!bang` or pure-interceptor `/slash` command the
+        // shell ran via `window.thclaws.run(...)`. Without this arm a
+        // domain shell that fetches state with `run("!script ...")`
+        // (e.g. Book Studio's status poll) gets NOTHING back — the bang
+        // path emits `SlashOutput`, not `ToolCallResult`, so its 15s
+        // refresh + reload button were silently no-ops. Deliver it as a
+        // `tool_result` (the channel shells already parse), labelled
+        // "Bash" since bang commands run as bash.
+        ViewEvent::SlashOutput(text) => Some(
+            serde_json::json!({
+                "type": "gui_shell_event",
+                "event": "tool_result",
+                "payload": {
+                    "name": "Bash",
+                    "output": strip_ansi(text),
+                },
+            })
+            .to_string(),
+        ),
+        // Session (re)load / switch: ship the whole transcript so a
+        // chat-first shell (`<thc-chat>`) can repaint its history — the
+        // reconnect case a browser hits after detaching from a running
+        // run. Without this arm HistoryReplaced fell through to `None`
+        // and Mode B shells never saw prior turns.
+        ViewEvent::HistoryReplaced(messages) => Some(gui_shell_history_envelope(messages)),
         _ => None,
     }
+}
+
+/// One `gui_shell_event` envelope carrying a full transcript snapshot as
+/// `{event:"history", payload:{messages:[{role,content}]}}`. Shared by the
+/// `HistoryReplaced` dispatch arm above and the serve-mode reconnect
+/// hydration (server.rs), so both emit the identical shape a shell's
+/// `on("history")` handler consumes.
+pub fn gui_shell_history_envelope(messages: &[crate::shared_session::DisplayMessage]) -> String {
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": strip_ansi(&m.content) }))
+        .collect();
+    serde_json::json!({
+        "type": "gui_shell_event",
+        "event": "history",
+        "payload": { "messages": msgs },
+    })
+    .to_string()
 }
 
 // ── ANSI strip ─────────────────────────────────────────────────────
@@ -514,6 +607,10 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
         }
+        ViewEvent::TurnUsage(text) => {
+            // Dim per-turn token/cost footer on its own line (CLI parity).
+            Some(format!("\r\n\x1b[2m{}\x1b[0m\r\n", text.replace('\n', "\r\n")))
+        }
         ViewEvent::WorkflowReviewRequest {
             id,
             script,
@@ -538,6 +635,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             ))
         }
         ViewEvent::TurnDone => None,
+        ViewEvent::BusyChanged => None,
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
             for (i, m) in messages.iter().enumerate() {
@@ -575,6 +673,7 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::ErrorText(text) => Some(format!("\r\n\x1b[31m{text}\x1b[0m\r\n")),
         ViewEvent::SessionListRefresh(_) => None,
         ViewEvent::ProviderUpdate(_) => None,
+        ViewEvent::SettingsChanged(_) => None,
         ViewEvent::KmsUpdate(_) => None,
         ViewEvent::McpUpdate(_) => None,
         ViewEvent::LineStatus(_) => None,
@@ -583,12 +682,15 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
         ViewEvent::ResearchUpdate(_) => None,
         ViewEvent::ModelPickerOpen(_) => None,
         ViewEvent::ScheduleAddOpen(_) => None,
+        ViewEvent::AgentEditorOpen(_) => None,
+        ViewEvent::MarketplaceOpen(_) => None,
         ViewEvent::ContextWarning { file_size_mb } => Some(format!(
             "\r\n\x1b[33m[ session {:.1} MB — /fork to continue in a new session with summary ]\x1b[0m\r\n",
             file_size_mb
         )),
         ViewEvent::McpAppCallToolResult { .. } => None,
         ViewEvent::QuitRequested => None,
+        ViewEvent::ReloadRequested => None,
         ViewEvent::PlanUpdate(_) => None,
         ViewEvent::TodoUpdate(_) => None,
         ViewEvent::SkillModelNote(text) => Some(format!("\r\n\x1b[2;3m{text}\x1b[0m\r\n")),
@@ -756,6 +858,44 @@ mod chat_render_tests {
         assert_eq!(parsed["text"], raw);
     }
 
+    /// A shell that shows per-turn cost needs the usage line, which is
+    /// emitted as its own ViewEvent AFTER the text and BEFORE TurnDone.
+    /// It used to fall through to `None`, so shells could not tell the
+    /// user what a turn cost — the number that matters most on cloud,
+    /// where it's their credits.
+    #[test]
+    fn turn_usage_reaches_shells() {
+        let out = render_gui_shell_dispatch(&ViewEvent::TurnUsage(
+            "\u{1b}[2m[tokens: 2in/5out · 3.4s]\u{1b}[0m".into(),
+        ))
+        .expect("TurnUsage should produce a gui_shell event");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["type"], "gui_shell_event");
+        assert_eq!(parsed["event"], "usage");
+        // Shell markup is HTML, not a terminal — colour codes must not
+        // ride along into it.
+        assert_eq!(parsed["payload"]["text"], "[tokens: 2in/5out · 3.4s]");
+    }
+
+    #[test]
+    fn gui_shell_slash_output_becomes_bash_tool_result() {
+        // Regression: a `!bang` status fetch (SlashOutput) used to map to
+        // None for gui shells, so Book Studio's status poll silently got
+        // nothing. It must arrive as a `tool_result` the shell can parse.
+        let out = render_gui_shell_dispatch(&ViewEvent::SlashOutput(
+            "[!] book.py status\n{\"next_action\": \"run_audit\"}".into(),
+        ))
+        .expect("SlashOutput should produce a gui_shell event");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["type"], "gui_shell_event");
+        assert_eq!(parsed["event"], "tool_result");
+        assert_eq!(parsed["payload"]["name"], "Bash");
+        assert!(parsed["payload"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("next_action"));
+    }
+
     /// Restored chat history is rendered into the terminal as one
     /// linear ANSI string. Each user message after the first should
     /// start with a blank line so conversation turns are visually
@@ -768,18 +908,22 @@ mod chat_render_tests {
             DisplayMessage {
                 role: "user".into(),
                 content: "first prompt".into(),
+                thinking: None,
             },
             DisplayMessage {
                 role: "assistant".into(),
                 content: "ok".into(),
+                thinking: None,
             },
             DisplayMessage {
                 role: "tool".into(),
                 content: "Bash".into(),
+                thinking: None,
             },
             DisplayMessage {
                 role: "user".into(),
                 content: "follow-up".into(),
+                thinking: None,
             },
         ];
         let out = render_terminal_ansi(&mut state, &ViewEvent::HistoryReplaced(msgs))
@@ -799,5 +943,33 @@ mod chat_render_tests {
             !stripped.contains("\r\n\r\n> first prompt"),
             "first user prompt should not have a leading blank line; got: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn history_replaced_emits_gui_shell_history_event() {
+        use crate::shared_session::DisplayMessage;
+        let msgs = vec![
+            DisplayMessage {
+                role: "user".into(),
+                content: "research \x1b[1mGPUs\x1b[0m".into(),
+                thinking: None,
+            },
+            DisplayMessage {
+                role: "assistant".into(),
+                content: "done".into(),
+                thinking: None,
+            },
+        ];
+        let out = render_gui_shell_dispatch(&ViewEvent::HistoryReplaced(msgs))
+            .expect("HistoryReplaced should produce a gui_shell_event");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["type"], "gui_shell_event");
+        assert_eq!(v["event"], "history");
+        let m = &v["payload"]["messages"];
+        assert_eq!(m.as_array().unwrap().len(), 2);
+        assert_eq!(m[0]["role"], "user");
+        // ANSI stripped from restored content.
+        assert_eq!(m[0]["content"], "research GPUs");
+        assert_eq!(m[1]["role"], "assistant");
     }
 }

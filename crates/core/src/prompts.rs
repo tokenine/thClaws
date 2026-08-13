@@ -200,7 +200,8 @@ pub fn build_full_system_prompt(
     }
 
     // (4) External services
-    let services_section = services_prompt_section();
+    let browser_active = config.mcp_servers.iter().any(|s| s.name == "browser");
+    let services_section = services_prompt_section(browser_active);
     if !services_section.is_empty() {
         system.push_str("\n\n");
         system.push_str(&services_section);
@@ -248,6 +249,36 @@ pub fn build_full_system_prompt(
         system.push_str(&team_section);
     }
 
+    // (8b) GUI Shells authoring guide is no longer inlined here — it
+    // moved into the bundled `gui-shell` skill (dev-plan/43). The skill's
+    // ~200-char catalog entry is the trigger; invoking it loads the full
+    // guide AND opens the `gui-shell` tool gate (GuiShellCreate etc.), so
+    // the ~3KB manual no longer rides every GUI turn's system prompt.
+
+    // dev-plan/55: when masking is armed the model receives `[PHONE_1]`
+    // where the user typed a phone number. Without this note it reads the
+    // placeholder as an unfilled template and derails — asking the user to
+    // "send the real number", which then gets un-masked on the way out into
+    // a nonsense sentence about the number being a placeholder.
+    if crate::sensitive::active().is_some() {
+        system.push_str(
+            "\n\n# Redacted values\n\
+             Placeholders like `[PHONE_1]`, `[ID_2]`, `[NAME_1]`, `[PLATE_1]` \
+             stand for real personal data the user DID provide. It was hidden \
+             from you on purpose and is restored automatically before the user \
+             sees your reply, so:\n\
+             - Treat a placeholder as the value itself — it is not missing, \
+             not a template, not an error. Never ask the user to \"send the \
+             real one\".\n\
+             - Reuse it verbatim in your reply and in tool arguments (the same \
+             placeholder always means the same value); the real value is \
+             substituted back before any tool runs.\n\
+             - Don't reason about the placeholder's format — you cannot see \
+             the underlying digits or spelling, so don't validate, reformat, \
+             or comment on them.\n",
+        );
+    }
+
     // (7) Skill catalog + (8) Repl-only priming
     if let Some(store) = skill_store {
         if !store.skills.is_empty() {
@@ -291,13 +322,33 @@ fn append_repl_slash_shortcut_priming(system: &mut String) {
 /// configured, because unfamiliar tool names in the long tools-param
 /// list got glossed over. Moved here from `shared_session.rs` so CLI +
 /// print + agent_runtime get the same nudge.
-pub(crate) fn services_prompt_section() -> String {
+pub(crate) fn services_prompt_section(browser_active: bool) -> String {
     let mut bullets: Vec<String> = Vec::new();
 
-    let hal_ok = std::env::var("HAL_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
+    // Browser automation (Playwright MCP). The model otherwise tends to
+    // reach for `browser_take_screenshot` and read content off the
+    // pixels — slower, lossy, and it mis-reads text. Steer it to the
+    // snapshot (the actual page text) for content extraction; pixels
+    // only for things you genuinely have to *see*.
+    if browser_active {
+        bullets.push(
+            "**Browser automation** (Playwright tools active). When you need to \
+             READ or EXTRACT content from a page — translating headlines, \
+             scraping a list, pulling article text, reading a table — use \
+             `browser_snapshot` as your PRIMARY source. It returns the page's \
+             actual text / accessibility tree (effectively the source content), \
+             which is more accurate, cheaper, and more reliable than reading \
+             pixels. Use `browser_take_screenshot` ONLY as a fallback — when the \
+             answer isn't in the snapshot: charts, canvases, image-embedded \
+             text, or layout you must visually see. Do NOT default to \
+             screenshots for text you could read from the snapshot."
+                .to_string(),
+        );
+    }
+
+    // Gateway-aware: in hosted gateway mode HAL is reachable with no
+    // local key, so the section advertises it there too.
+    let hal_ok = crate::tools::hal::hal_available();
     if hal_ok {
         bullets.push(
             "**HAL Public API** (key set). \
@@ -317,10 +368,14 @@ pub(crate) fn services_prompt_section() -> String {
         );
     }
 
-    let tavily_ok = std::env::var("TAVILY_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
+    // In hosted gateway mode the search keys live on the gateway, not
+    // in the runner's env — Tavily is reachable even with no local key.
+    let gateway_mode = std::env::var("THCLAWS_USES_GATEWAY").ok().as_deref() == Some("1");
+    let tavily_ok = gateway_mode
+        || std::env::var("TAVILY_API_KEY")
+            .ok()
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false);
     let brave_ok = std::env::var("BRAVE_SEARCH_API_KEY")
         .ok()
         .map(|k| !k.trim().is_empty())
@@ -368,28 +423,22 @@ pub(crate) fn services_prompt_section() -> String {
 /// The fuller team playbook below this section (rendered by
 /// `team_grounding_prompt` when teams are on) stays unchanged.
 pub(crate) fn collaboration_primitives_section(team_enabled: bool) -> String {
-    let teams_line = if team_enabled {
-        "**Agent Teams** — `TeamCreate` + `SpawnTeammate` start \
-         persistent parallel teammates with optional worktree \
-         isolation; `TeamTaskCreate` / `Claim` / `Complete` for the \
-         shared task queue; `SendMessage` / `CheckInbox` for async \
-         coordination. See the detailed playbook below."
-    } else {
-        "**Agent Teams** — disabled in this workspace \
-         (`teamEnabled: false`). The Team* tools are NOT registered; \
-         do not try to call them. For multi-step parallel work, \
-         reach for Subagent or WorkflowRun above."
-    };
-    format!(
-        "# Collaboration primitives\n\n\
-         Three ways to decompose work — pick by shape, not size:\n\n\
-         1. **Subagent** — the `Task` tool launches one scoped child \
+    // Prompt hygiene: when Agent Teams are OFF, the section must not mention
+    // teams or the `teamEnabled` flag AT ALL — naming a disabled feature (and
+    // a config flag) only invites the model to reason about it and conflate
+    // it with the always-available Subagent (`Task`) tool. So we omit the
+    // Teams item entirely when off, rather than printing a "disabled" notice.
+    let subagent = "**Subagent** — the `Task` tool launches one scoped child \
          agent that returns a transcript when done. Always available. \
          Use for a single side-quest that would clutter history, a \
          read-only sweep, or a well-defined delegation. NOT for \
-         parallel fan-out (one call = one child).\n\n\
-         2. {teams_line}\n\n\
-         3. **WorkflowRun** — `WorkflowRun(prompt: \"…\")` authors a \
+         parallel fan-out (one call = one child).";
+    let teams = "**Agent Teams** — `TeamCreate` + `SpawnTeammate` start \
+         persistent parallel teammates with optional worktree \
+         isolation; `TeamTaskCreate` / `Claim` / `Complete` for the \
+         shared task queue; `SendMessage` / `CheckInbox` for async \
+         coordination. See the detailed playbook below.";
+    let workflow = "**WorkflowRun** — `WorkflowRun(prompt: \"…\")` authors a \
          JavaScript orchestration script and runs it in a Boa \
          sandbox. Use for deterministic fan-out across N items, \
          retry loops, multistep pipelines with budget control, or \
@@ -397,7 +446,25 @@ pub(crate) fn collaboration_primitives_section(team_enabled: bool) -> String {
          Requires user approval per invocation. Nested WorkflowRun \
          calls (from inside a running workflow) are rejected — \
          orchestrate via `thclaws.subagent(...)` / \
-         `thclaws.parallel(...)` inside the script instead.\n"
+         `thclaws.parallel(...)` inside the script instead.";
+
+    let mut items: Vec<&str> = vec![subagent];
+    if team_enabled {
+        items.push(teams);
+    }
+    items.push(workflow);
+
+    let count_word = if items.len() == 3 { "Three" } else { "Two" };
+    let numbered = items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "# Collaboration primitives\n\n\
+         {count_word} ways to decompose work — pick by shape, not size:\n\n\
+         {numbered}\n"
     )
 }
 
@@ -460,7 +527,11 @@ pub(crate) fn documents_prompt_section() -> String {
          outline: `# Heading` starts a new slide, bullets become body. \
          Read extracts slide text.\n\
          - **PdfCreate** / **PdfRead** — PDF. Markdown in, supports \
-         tables, inline images, embedded fonts. A4 / Letter / Legal.\n\n\
+         tables, inline images, embedded fonts. A4 / Letter / Legal.\n\
+         - **EpubCreate** — reflowable EPUB 3 e-book. Markdown in, splits \
+         into chapters at headings, embeds images + Noto fonts, builds \
+         navigation. Use for e-books / long-form reading on e-readers \
+         (a PDF is fixed-layout; an EPUB reflows to the device).\n\n\
          Use these for the matching format every time. Do NOT call \
          generic `Read` on `.docx` / `.xlsx` / `.pptx` / `.pdf` — it \
          returns raw bytes the model can't parse; the dedicated `*Read` \
@@ -611,7 +682,7 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
              `Agent`, `TodoWrite`, `AskUserQuestion`, `ToolSearch`, \
              `SendMessage` built-ins backed by `~/.claude/teams/` and \
              `~/.claude/tasks/`. DO NOT CALL THEM. Their state is invisible \
-             to thClaws — the Team tab polls `.thclaws/team/agents/` locally \
+             to thClaws — the Team tab polls `.thclaws/state/team/agents/` locally \
              and will never see an SDK-created team, so the user gets a \
              fabricated success story with nothing behind it.\n\n\
              If the user asks you to \"create a team\" / \"spawn agents\" / \
@@ -635,7 +706,7 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
          parallel work via a team, use ONLY these thClaws tools — they are the \
          canonical implementation and their state is visible in the Team tab:\n\n\
          - `TeamCreate` — define a team (name + member agents with roles/prompts). \
-         Writes `.thclaws/team/config.json` in the current project root.\n\
+         Writes `.thclaws/state/team/config.json` in the current project root.\n\
          - `SpawnTeammate` — start one named teammate. Spawns a thClaws subprocess \
          that polls its inbox in a tmux pane (or background).\n\
          - `SendMessage` — deliver a message to a teammate's inbox.\n\
@@ -645,7 +716,7 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
          a shared task queue teammates can claim from.\n\
          - `TeamMerge` — (lead only) merge each teammate's git worktree back into \
          the main branch.\n\n\
-         Team state lives under `.thclaws/team/` **in the current project root** — \
+         Team state lives under `.thclaws/state/team/` **in the current project root** — \
          NOT under `~/.claude/teams/`, NOT under `~/.claude/tasks/`. Do not reference \
          those paths; they are from a different product.\n\n\
          You are the team **lead**. After `TeamCreate`:\n\
@@ -677,7 +748,7 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
          workspace mean the thClaws versions — never the SDK's.\n\
          - Never reference `~/.claude/teams/`, `~/.claude/tasks/`, or \
          `~/.config/thclaws/teams/` paths in your replies. Teams live in \
-         `.thclaws/team/`.\n\
+         `.thclaws/state/team/`.\n\
          - Do not call `AskUserQuestion`, `TodoWrite`, `ToolSearch`, or a bare \
          `Agent` tool. Those belong to Claude Code's interactive flow and do \
          not exist in thClaws. If you need a task list, use `TeamTaskCreate`. \
@@ -694,7 +765,7 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
              which ships its own `TeamCreate`, `Agent`, `AskUserQuestion`, \
              `TodoWrite`, and `ToolSearch` built-ins. Calling them will appear \
              to succeed inside Claude Code's own world, but the thClaws Team \
-             tab polls `.thclaws/team/agents/` and will never see a team \
+             tab polls `.thclaws/state/team/agents/` and will never see a team \
              created that way. Treat any impulse to call those tools as a bug.\n",
         );
     }
@@ -705,6 +776,34 @@ pub(crate) fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dev-plan/55: with masking armed the model sees `[PHONE_1]` where the
+    /// user typed a number. Live-testing v1 showed what happens without the
+    /// briefing — the model treats the placeholder as an unfilled template
+    /// and asks the user to "send the real number", which the un-masker then
+    /// rewrites into a sentence claiming the real number is a placeholder.
+    #[test]
+    fn masking_briefs_the_model_only_while_armed() {
+        let _guard = crate::kms::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::AppConfig::default();
+
+        crate::sensitive::configure(false, Vec::new());
+        let off = build_full_system_prompt(&config, tmp.path(), None, &[], SurfaceHints::Gui);
+        crate::sensitive::configure(true, Vec::new());
+        let on = build_full_system_prompt(&config, tmp.path(), None, &[], SurfaceHints::Gui);
+        crate::sensitive::configure(false, Vec::new());
+
+        assert!(on.contains("# Redacted values"), "no briefing while armed");
+        assert!(
+            on.contains("[PHONE_1]") && on.contains("not a template"),
+            "briefing must name the shape and kill the template reading"
+        );
+        assert!(
+            !off.contains("# Redacted values"),
+            "briefing leaked into a prompt with masking off"
+        );
+    }
 
     /// Tier-2 followup test: the Repl surface adds the slash-command
     /// shortcut priming after the skill catalog; Gui / Headless do
@@ -887,30 +986,44 @@ mod tests {
         eprintln!("  diff /tmp/thclaws-prompt-gui.txt /tmp/thclaws-prompt-headless.txt");
     }
 
-    /// `collaboration_primitives_section` always includes Subagent +
-    /// WorkflowRun (both always-available) and a team line that
-    /// swaps based on `team_enabled`. The swap matters because the
-    /// model otherwise would see Team tool names it can't call.
+    /// `collaboration_primitives_section`: Subagent + WorkflowRun are always
+    /// listed; the Agent Teams item appears ONLY when `team_enabled`. When
+    /// off, the section must not mention teams or the `teamEnabled` flag at
+    /// all — naming a disabled feature lets the model conflate it with the
+    /// always-available Subagent (`Task`) tool (observed: a model decided
+    /// "no Task tool because teamEnabled: false", which is nonsense).
     #[test]
-    fn collaboration_section_lists_all_three_primitives() {
+    fn collaboration_section_lists_primitives_by_team_state() {
         let on = collaboration_primitives_section(true);
         assert!(on.starts_with("# Collaboration primitives"));
+        assert!(on.contains("Three ways"));
         assert!(on.contains("**Subagent**"));
         assert!(on.contains("`Task`"));
         assert!(on.contains("**Agent Teams**"));
         assert!(on.contains("`TeamCreate`"));
         assert!(on.contains("**WorkflowRun**"));
-        assert!(on.contains("`WorkflowRun(prompt"));
 
         let off = collaboration_primitives_section(false);
-        assert!(off.contains("disabled in this workspace"));
-        assert!(
-            !off.contains("`TeamCreate`"),
-            "team-off prompt must not name Team tools"
-        );
-        // Subagent + WorkflowRun appear regardless of team_enabled.
+        assert!(off.contains("Two ways"), "team-off → only 2 primitives");
         assert!(off.contains("**Subagent**"));
         assert!(off.contains("**WorkflowRun**"));
+        // The whole point: ZERO team / flag mentions when off.
+        assert!(
+            !off.contains("Agent Teams"),
+            "team-off must not mention Agent Teams"
+        );
+        assert!(
+            !off.contains("teamEnabled"),
+            "team-off must not mention the teamEnabled flag"
+        );
+        assert!(
+            !off.contains("`TeamCreate`"),
+            "team-off must not name Team tools"
+        );
+        assert!(
+            !off.to_lowercase().contains("team"),
+            "team-off must not say 'team' at all"
+        );
     }
 
     /// The unified builder slots the Collaboration section between
@@ -936,6 +1049,27 @@ mod tests {
             assert!(
                 p.contains("**WorkflowRun**"),
                 "{surface:?}: WorkflowRun must be named so the model knows it can call it",
+            );
+        }
+    }
+
+    /// The GUI Shells authoring guide is no longer inlined in the system
+    /// prompt on ANY surface — it moved into the bundled `gui-shell`
+    /// skill (dev-plan/43), which loads the guide + opens the tool gate
+    /// only when invoked. Guards against the ~3KB block creeping back.
+    #[test]
+    fn gui_shells_authoring_prose_not_inlined_in_system_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = crate::config::AppConfig::default();
+        for surface in [
+            SurfaceHints::Gui,
+            SurfaceHints::Repl,
+            SurfaceHints::Headless,
+        ] {
+            let p = build_full_system_prompt(&config, tmp.path(), None, &[], surface);
+            assert!(
+                !p.contains("# GUI Shells (authoring)"),
+                "{surface:?}: GUI Shells authoring prose must NOT be inlined — it's a skill now",
             );
         }
     }
@@ -1121,7 +1255,7 @@ mod tests {
         // directive is now unconditional and front-loaded.
         let s = defaults::SYSTEM;
         assert!(
-            s.contains(".thclaws/todos.md"),
+            s.contains(".thclaws/state/todos.md"),
             "system prompt must name the todos file path",
         );
         assert!(

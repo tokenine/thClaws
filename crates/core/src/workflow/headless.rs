@@ -72,22 +72,49 @@ pub async fn run(
     tools.register(Arc::new(crate::tools::KmsReadTool));
     tools.register(Arc::new(crate::tools::KmsSearchTool));
     tools.register(Arc::new(crate::tools::KmsWriteTool));
+    tools.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tools.register(Arc::new(crate::tools::KmsAppendTool));
     tools.register(Arc::new(crate::tools::KmsDeleteTool));
     tools.register(Arc::new(crate::tools::KmsCreateTool));
     tools.register(Arc::new(crate::tools::MemoryReadTool));
     tools.register(Arc::new(crate::tools::MemoryWriteTool));
     tools.register(Arc::new(crate::tools::MemoryAppendTool));
+    // Opt-in native Gemini image tools — workflow workers draft
+    // chapter figures (book-author) just like the lead session.
+    if config.image_tools_enabled {
+        tools.register(Arc::new(crate::tools::TextToImageTool));
+        tools.register(Arc::new(crate::tools::ImageToImageTool));
+        tools.register(Arc::new(crate::tools::TextToSpeechTool));
+        tools.register(Arc::new(crate::tools::RenderSlidesTool));
+        tools.register(Arc::new(crate::tools::TextToVideoTool));
+        tools.register(Arc::new(crate::tools::ImageToVideoTool));
+        tools.register(Arc::new(crate::tools::MediaJobStatusTool));
+    }
+
+    if config.hal_enabled {
+        tools.register(Arc::new(crate::tools::YouTubeTranscriptTool::new()));
+        tools.register(Arc::new(crate::tools::WebScrapeTool::new()));
+    }
 
     let provider = crate::repl::build_provider(&config)?;
     let approver: Arc<dyn ApprovalSink> = Arc::new(AutoApprover);
 
-    let agent_defs = crate::agent_defs::AgentDefsConfig::load();
-    let factory = Arc::new(ProductionAgentFactory {
-        provider: provider.clone(),
-        base_tools: tools.clone(),
-        model: config.model.clone(),
+    // I2: match CLI/GUI — surface plugin-contributed agent defs and apply
+    // settings.json built-in subagent model overrides.
+    let mut agent_defs =
+        crate::agent_defs::AgentDefsConfig::load_with_extra(&crate::plugins::plugin_agent_dirs());
+    agent_defs.apply_builtin_subagent_overrides(&config);
+    // Workflow headless is one-shot — no mid-run mutators that would
+    // need to refresh this snapshot, so the Arc is owned solely by
+    // the factory (no worker writer side).
+    let factory_snapshot = Arc::new(std::sync::RwLock::new(crate::subagent::FactorySnapshot {
         system: system.clone(),
+        tools: tools.clone(),
+        model: config.model.clone(),
+        provider: provider.clone(),
+    }));
+    let factory = Arc::new(ProductionAgentFactory {
+        snapshot: factory_snapshot,
         max_iterations: config.max_iterations,
         max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
         max_tokens: config.max_tokens,
@@ -120,6 +147,7 @@ pub async fn run(
     let script_for_thread = script.clone();
     let cache_for_thread = if cache.is_empty() { None } else { Some(cache) };
     let logger_for_thread = logger_handle.clone();
+    let cwd_for_thread = cwd.clone();
 
     let wf_started = std::time::Instant::now();
     let (result, usages, remaining): (
@@ -131,6 +159,7 @@ pub async fn run(
         crate::workflow::set_logger(Some(logger_for_thread));
         crate::workflow::set_usage_sink(true);
         crate::workflow::set_replay_cache(cache_for_thread);
+        crate::workflow::set_include_base(Some(cwd_for_thread));
         let res = (|| -> std::result::Result<String, String> {
             let mut sandbox = crate::workflow::WorkflowSandbox::new().map_err(|e| e.to_string())?;
             sandbox.run(&script_for_thread).map_err(|e| e.to_string())
@@ -141,6 +170,7 @@ pub async fn run(
         crate::workflow::set_logger(None);
         crate::workflow::set_usage_sink(false);
         crate::workflow::set_replay_cache(None);
+        crate::workflow::set_include_base(None);
         (res, usages, remaining)
     })
     .await

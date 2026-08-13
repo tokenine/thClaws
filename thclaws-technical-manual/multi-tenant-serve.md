@@ -23,6 +23,42 @@ This doc covers what shipped in Tier 1, the HMAC handshake the routing layer mus
 
 ---
 
+## 0. What changed after Tier 1 (dev-plan/42 + /45)
+
+The sections below describe the original Tier-1 shape. Several of its
+"not yet" caveats have since shipped — read this first:
+
+- **Identity is Ed25519, not (only) HMAC.** When a pod is provisioned with
+  `THCLAWS_CLOUD_PUBKEY` (the hosted default), the `X-Thclaws-User-Sig`
+  header is **required** and the symmetric HMAC path is refused — no
+  downgrade. The API holds the per-workspace signing key; the pod gets only
+  the public key (`multi_tenant/auth.rs::IdentityVerifier::Ed25519`,
+  `from_secret_and_pubkey`). HMAC (§3) is the dev / single-secret fallback.
+- **Billing is at the GATEWAY, not the pod's `MeteringSink`.** Hosted
+  inference is metered where it's proxied: the gateway writes a
+  `usage_events` row + atomically debits credit per call (`credit.rs`). The
+  pod-side `MeteringSink` trait still exists but is not the hosted billing
+  path. Per-member attribution rides an `X-Thclaws-Member` header
+  (`multi_tenant/member.rs`) → `usage_events.member_id`, enforcing a
+  **per-(workspace, member) daily cap** + a workspace daily cap (both
+  **fail-open** on a query error).
+- **Key-custody sidecar (dev-plan/45 C).** In a multiuser pod the real
+  `gw_v1_…` gateway key is NOT in the engine container — a loopback
+  `thclaws-gateway-sidecar` holds it; the engine points at
+  `http://127.0.0.1:8088` with a non-secret `sidecar-loopback` marker, so a
+  member's shell can't exfiltrate the key.
+- **Cross-user read isolation shipped (dev-plan/45 F / dp49).** The `cat
+  /etc/passwd` / cross-tenant-read caveat in §12 is closed: bash runs under
+  a Landlock read-mask (allowlist = system dirs + the member's own
+  `workspace-<id>/`; **`/proc` and co-tenants' subtrees are NOT granted**),
+  and the in-process file tools resolve against the per-user root. Only
+  per-member CPU/RAM cgroup caps remain Tier-3.
+- **Cross-pod rate limit (dev-plan/45 E).** The gateway adds a Redis-backed
+  per-user token bucket (`GATEWAY_REDIS_URL`, fail-open) on top of the
+  in-pod limiter.
+
+---
+
 ## 1. Architecture
 
 ```

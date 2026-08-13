@@ -247,6 +247,25 @@ pub struct Session {
     /// `gui_shell_event` dispatches instead of `chat_*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellMeta>,
+    /// Per-turn cost/latency footers, in the order they were produced.
+    /// The chat surfaces render one under each completed turn; without
+    /// persisting them, reopening a session showed the conversation
+    /// with every "what did this cost" line stripped out. `after`
+    /// records how many messages existed when the turn ended, so the
+    /// footer can be dropped back into the right place on load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_usage: Vec<TurnUsage>,
+}
+
+/// One rendered per-turn usage footer plus where it belongs in the
+/// message list. Stored as the finished string rather than raw counts:
+/// it is display data, and re-deriving the same line later would mean
+/// re-implementing the formatter (and its cost accounting) at load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnUsage {
+    /// `messages.len()` at the moment the turn completed.
+    pub after: usize,
+    pub text: String,
 }
 
 impl PartialEq for Session {
@@ -279,6 +298,7 @@ impl Session {
             model: model.into(),
             cwd: cwd.into(),
             messages: Vec::new(),
+            turn_usage: Vec::new(),
             title: None,
             last_saved_count: 0,
             plan: None,
@@ -306,6 +326,9 @@ impl Session {
     /// the next save.
     pub fn sync(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        if self.last_saved_count > self.messages.len() {
+            self.last_saved_count = self.messages.len();
+        }
         self.updated_at = now_secs();
     }
 
@@ -449,6 +472,12 @@ impl Session {
         path: &Path,
         plan: Option<&crate::tools::plan_state::Plan>,
     ) -> Result<()> {
+        // Skip the redundant "still no plan" snapshot: writing `{plan:null}`
+        // on every turn when there was never a plan just bloats the file. A
+        // real transition (a plan appearing, or being cleared) still writes.
+        if plan.is_none() && self.plan.is_none() {
+            return Ok(());
+        }
         append_plan_snapshot(path, plan)?;
         self.plan = plan.cloned();
         self.updated_at = now_secs();
@@ -464,8 +493,38 @@ impl Session {
         path: &Path,
         goal: Option<&crate::goal_state::GoalState>,
     ) -> Result<()> {
+        // Same anti-bloat rule as plan: don't rewrite `{goal:null}` every turn
+        // when there was never a goal. A real set/clear transition still writes.
+        if goal.is_none() && self.goal.is_none() {
+            return Ok(());
+        }
         append_goal_snapshot(path, goal)?;
         self.goal = goal.cloned();
+        self.updated_at = now_secs();
+        Ok(())
+    }
+
+    /// Append this turn's usage footer to the JSONL and remember it in
+    /// memory, so both a live reload and a fresh `/load` show it.
+    pub fn append_turn_usage_to(&mut self, path: &Path, text: &str) -> Result<()> {
+        let after = self.messages.len();
+        append_turn_usage(path, after, text)?;
+        self.turn_usage.push(TurnUsage {
+            after,
+            text: text.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Record a mid-session model switch: append a `model` event (so a restore
+    /// recovers the new provider even with no following chat turn) and update
+    /// the in-memory label. No-op when the model is unchanged.
+    pub fn record_model_to(&mut self, path: &Path, model: &str) -> Result<()> {
+        if self.model == model {
+            return Ok(());
+        }
+        append_model_event(path, model)?;
+        self.model = model.to_string();
         self.updated_at = now_secs();
         Ok(())
     }
@@ -496,6 +555,10 @@ impl Session {
         let mut title: Option<String> = None;
         let mut message_count = 0usize;
         let mut skipped = 0usize;
+        // Newest model wins: the header carries only the creation model, but a
+        // `model` event (mid-session switch) or an assistant line records later
+        // switches. Track the last one seen so restore lands on the right model.
+        let mut latest_model: Option<String> = None;
 
         for line_result in reader.lines() {
             let line = match line_result {
@@ -584,7 +647,16 @@ impl Session {
                             last_timestamp = ts;
                         }
                     }
+                    // Assistant lines carry the model that produced the turn.
+                    if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                        latest_model = Some(m.to_string());
+                    }
                     message_count += 1;
+                }
+                "model" => {
+                    if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                        latest_model = Some(m.to_string());
+                    }
                 }
                 _ => {
                     skipped += 1;
@@ -629,7 +701,7 @@ impl Session {
             } else {
                 h.created_at
             },
-            model: h.model,
+            model: latest_model.unwrap_or(h.model),
             message_count,
             title,
         })
@@ -653,6 +725,7 @@ impl Session {
         let mut header: Option<SessionHeader> = None;
         let mut messages = Vec::new();
         let mut last_timestamp = 0u64;
+        let mut turn_usage: Vec<TurnUsage> = Vec::new();
         let mut title: Option<String> = None;
         let mut plan: Option<crate::tools::plan_state::Plan> = None;
         let mut goal: Option<crate::goal_state::GoalState> = None;
@@ -662,6 +735,9 @@ impl Session {
         // than `anthropic-agent` today).
         let mut provider_session_id: Option<String> = None;
         let mut skipped: usize = 0;
+        // Newest model wins (see load_meta_from): a `model` event or an
+        // assistant line records mid-session switches after the header.
+        let mut latest_model: Option<String> = None;
 
         for (line_num, line_result) in reader.lines().enumerate() {
             let line = match line_result {
@@ -733,6 +809,16 @@ impl Session {
                 } else {
                     Some(trimmed.to_string())
                 };
+            } else if kind == "turn_usage" {
+                // Display-only, and a restore artifact never writes one,
+                // so it must not move `last_timestamp` (same reasoning as
+                // plan_snapshot below).
+                if let Ok(ev) = serde_json::from_value::<TurnUsageEvent>(val) {
+                    turn_usage.push(TurnUsage {
+                        after: ev.after,
+                        text: ev.text,
+                    });
+                }
             } else if kind == "plan_snapshot" {
                 // Latest snapshot wins. `null` plan means the active
                 // plan was cleared (M1+).
@@ -800,6 +886,11 @@ impl Session {
                     }
                 };
                 provider_session_id = ev.provider_session_id;
+            } else if kind == "model" {
+                // Mid-session model switch marker (newest wins).
+                if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                    latest_model = Some(m.to_string());
+                }
             } else if kind == "compaction" {
                 // Replay checkpoint: everything accumulated so far is
                 // archived-on-disk but gets replaced in memory by the
@@ -875,6 +966,11 @@ impl Session {
                     last_timestamp = event.timestamp;
                 }
 
+                // Assistant lines carry the model that produced the turn.
+                if let Some(ref m) = event.model {
+                    latest_model = Some(m.clone());
+                }
+
                 messages.push(Message {
                     role,
                     content: event.content,
@@ -930,7 +1026,7 @@ impl Session {
             } else {
                 h.created_at
             },
-            model: h.model,
+            model: latest_model.unwrap_or(h.model),
             cwd: h.cwd,
             messages,
             title,
@@ -939,6 +1035,7 @@ impl Session {
             goal,
             provider_session_id,
             shell: h.shell,
+            turn_usage,
         })
     }
 
@@ -1058,6 +1155,32 @@ impl Session {
 /// the GUI's plan-state broadcaster, which fires from a closure that
 /// only has the JSONL path. Same wire format as the method; no
 /// in-memory state to update. M1+.
+/// JSONL record for one completed turn's usage footer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TurnUsageEvent {
+    #[serde(rename = "type")]
+    kind: String, // always "turn_usage"
+    after: usize,
+    text: String,
+    timestamp: u64,
+}
+
+/// Append a per-turn usage footer. Called once per completed turn, so a
+/// reloaded session shows the same cost/latency lines the live one did.
+pub fn append_turn_usage(path: &Path, after: usize, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let event = TurnUsageEvent {
+        kind: "turn_usage".into(),
+        after,
+        text: text.to_string(),
+        timestamp: now_secs(),
+    };
+    let line = serde_json::to_string(&event)?;
+    append_locked(path, |file| writeln!(file, "{}", line))
+}
+
 pub fn append_plan_snapshot(
     path: &Path,
     plan: Option<&crate::tools::plan_state::Plan>,
@@ -1091,6 +1214,22 @@ pub fn append_goal_snapshot(
         timestamp: now_secs(),
     };
     let line = serde_json::to_string(&event)?;
+    append_locked(path, |file| writeln!(file, "{}", line))
+}
+
+/// Append a `model` event recording a mid-session model switch. The header
+/// line carries only the CREATION model (append-only — it's never rewritten),
+/// so without this a switch that isn't followed by a chat turn would be lost on
+/// restore. `load_*` scans these (newest wins) to recover the active model.
+pub fn append_model_event(path: &Path, model: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_string(&serde_json::json!({
+        "type": "model",
+        "model": model,
+        "timestamp": now_secs(),
+    }))?;
     append_locked(path, |file| writeln!(file, "{}", line))
 }
 
@@ -1132,15 +1271,16 @@ impl SessionStore {
         Self { root }
     }
 
-    /// Always project-scoped: `./.thclaws/sessions/`. Starting in a blank
-    /// directory gives you an empty session list — legacy user-level sessions
-    /// at `~/.local/share/thclaws/sessions/` and `~/.claude/sessions/` are
-    /// left alone (you can move them into a project's `.thclaws/sessions/` to
-    /// import). The dir is created on first save; we don't materialise it
-    /// just to list.
+    /// Always project-scoped: `./.thclaws/state/sessions/` (workspace v2 —
+    /// runtime state lives under `state/`). Starting in a blank directory
+    /// gives you an empty session list — legacy user-level sessions at
+    /// `~/.local/share/thclaws/sessions/` and `~/.claude/sessions/` are
+    /// left alone (you can move them into a project's
+    /// `.thclaws/state/sessions/` to import). The dir is created on first
+    /// save; we don't materialise it just to list.
     pub fn default_path() -> Option<PathBuf> {
         let cwd = std::env::current_dir().ok()?;
-        Some(cwd.join(".thclaws").join("sessions"))
+        Some(cwd.join(".thclaws").join("state").join("sessions"))
     }
 
     pub fn path_for(&self, id: &str) -> PathBuf {
@@ -1313,6 +1453,20 @@ impl SessionStore {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    // Skip subagent session files (`sub-<id>.jsonl`, written by
+                    // subagent.rs::persist_subagent_session). They are internal
+                    // transcripts, never user-resumable: the filename carries a
+                    // `sub-` prefix but the header `id` inside does NOT, so a
+                    // `load(meta.id)` derives `<id>.jsonl` and can't find the
+                    // `sub-<id>.jsonl` file — surfacing them made every click on
+                    // one in the session list fail with "Failed to load session".
+                    if path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with("sub-"))
+                    {
+                        continue;
+                    }
                     if let Ok(meta) = Session::load_meta_from(&path) {
                         out.push(meta);
                     }
@@ -1327,6 +1481,19 @@ impl SessionStore {
         match metas.first() {
             Some(m) => Ok(Some(self.load(&m.id)?)),
             None => Ok(None),
+        }
+    }
+
+    /// Startup helper: the most-recent session **iff it carries no
+    /// messages**. App launch reuses this (instead of minting — and
+    /// persisting — yet another empty session every time) so empty
+    /// session files don't pile up. Returns `None` when there are no
+    /// sessions or the latest one already has chat history (so launch
+    /// still lands on a clean session rather than resuming a real chat).
+    pub fn reuse_empty_latest(&self) -> Result<Option<Session>> {
+        match self.latest()? {
+            Some(s) if s.messages.is_empty() => Ok(Some(s)),
+            _ => Ok(None),
         }
     }
 
@@ -1527,6 +1694,57 @@ mod tests {
         assert_eq!(event["type"], "user");
         assert!(event["content"].is_array());
         assert!(event["timestamp"].is_number());
+    }
+
+    #[test]
+    fn model_switch_persists_and_restores_latest_model() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut session = Session::new("openai/gpt-4.1", "/tmp");
+        store.save(&mut session).unwrap();
+        let path = store.path_for(&session.id);
+
+        // Switch model with NO chat turn following.
+        session
+            .record_model_to(&path, "anthropic/claude-sonnet-4-6")
+            .unwrap();
+
+        // Both load paths recover the switched-to model, not the header's.
+        let loaded = Session::load_from(&path).unwrap();
+        assert_eq!(loaded.model, "anthropic/claude-sonnet-4-6");
+        let meta = Session::load_meta_from(&path).unwrap();
+        assert_eq!(meta.model, "anthropic/claude-sonnet-4-6");
+
+        // No-op when unchanged — doesn't append a duplicate event.
+        let before = std::fs::read_to_string(&path).unwrap();
+        session
+            .record_model_to(&path, "anthropic/claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn redundant_null_plan_goal_snapshots_are_not_written() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut session = Session::new("m", "/tmp");
+        store.save(&mut session).unwrap();
+        let path = store.path_for(&session.id);
+
+        // No plan/goal ever set → repeated null snapshots must not be written.
+        for _ in 0..5 {
+            session.append_plan_snapshot_to(&path, None).unwrap();
+            session.append_goal_snapshot_to(&path, None).unwrap();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("plan_snapshot"),
+            "null plan snapshots should be skipped"
+        );
+        assert!(
+            !content.contains("goal_snapshot"),
+            "null goal snapshots should be skipped"
+        );
     }
 
     #[test]
@@ -1841,6 +2059,42 @@ mod tests {
     }
 
     #[test]
+    fn reuse_empty_latest_only_when_latest_is_empty() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path()).unwrap();
+
+        // No sessions yet → nothing to reuse.
+        assert!(store.reuse_empty_latest().unwrap().is_none());
+
+        // Latest is header-only (empty) → reuse it instead of minting.
+        std::fs::write(
+            store.path_for("sess-empty"),
+            r#"{"type":"header","id":"sess-empty","model":"m","cwd":"/tmp","created_at":100}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store.reuse_empty_latest().unwrap().map(|s| s.id),
+            Some("sess-empty".to_string()),
+        );
+
+        // A newer session WITH a message becomes latest → don't reuse
+        // (launch lands on a fresh session, not this real chat).
+        std::fs::write(
+            store.path_for("sess-used"),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"header","id":"sess-used","model":"m","cwd":"/tmp","created_at":200}"#,
+                r#"{"type":"user","content":[{"type":"text","text":"hi"}],"timestamp":200}"#,
+            ),
+        )
+        .unwrap();
+        assert!(store.reuse_empty_latest().unwrap().is_none());
+    }
+
+    #[test]
     fn sync_bumps_updated_at_and_replaces_messages() {
         let mut session = Session::new("m", "/tmp");
         let before = session.updated_at;
@@ -1848,6 +2102,23 @@ mod tests {
         session.sync(sample_messages());
         assert_eq!(session.messages.len(), 3);
         assert!(session.updated_at > before);
+    }
+
+    #[test]
+    fn sync_clamps_last_saved_count_to_message_len() {
+        // Repro of the /clear-then-save panic (PR #134): if upstream
+        // shrinks the message vec below `last_saved_count`, the next
+        // `append_to` would slice out of range. `sync` clamps so the
+        // shorter vec is treated as "nothing new since last save".
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut session = Session::new("m", "/tmp");
+        session.sync(sample_messages());
+        store.save(&mut session).unwrap();
+        assert_eq!(session.last_saved_count, 3);
+        session.sync(Vec::new());
+        assert_eq!(session.last_saved_count, 0);
+        store.save(&mut session).unwrap();
     }
 
     #[test]
@@ -2205,6 +2476,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
         assert!(store.rename("sess-nonexistent", "x").is_err());
+    }
+
+    #[test]
+    fn list_excludes_subagent_session_files() {
+        // subagent.rs persists `sub-<id>.jsonl` whose header `id` LACKS the
+        // `sub-` prefix, so list()->load(meta.id) can't find the file.
+        // They must not surface in the user-facing session list.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let mut real = Session::new("m", "/tmp");
+        real.sync(vec![Message::user("hello")]);
+        store.save(&mut real).unwrap();
+        // A subagent transcript: filename `sub-sess-*.jsonl`, header id
+        // `sess-*` (the mismatch subagent.rs actually writes).
+        std::fs::write(
+            dir.path().join("sub-sess-deadbeef.jsonl"),
+            "{\"type\":\"header\",\"id\":\"sess-deadbeef\",\"model\":\"m\",\"cwd\":\"/tmp\",\"created_at\":1}\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = store.list().unwrap().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&real.id), "real session should be listed");
+        assert!(
+            !ids.iter().any(|id| id == "sess-deadbeef"),
+            "subagent session must be excluded; got {ids:?}"
+        );
     }
 
     #[test]

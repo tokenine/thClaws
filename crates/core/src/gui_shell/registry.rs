@@ -240,7 +240,7 @@ impl ShellRegistry {
 
     fn builtin_only_map() -> HashMap<String, EmbeddedShell> {
         let mut builtin = HashMap::new();
-        for shell in [session_explorer(), chatbot()] {
+        for shell in [session_explorer(), chatbot(), media_studio()] {
             builtin.insert(shell.manifest.id.clone(), shell);
         }
         builtin
@@ -307,7 +307,7 @@ impl Default for ShellRegistry {
 /// Falls back to `./.thclaws/gui-shell/` if HOME is unset (shouldn't
 /// happen on any reasonable OS — the project dir scan would catch
 /// the same shells anyway in that degenerate case).
-fn user_shell_dir() -> PathBuf {
+pub fn user_shell_dir() -> PathBuf {
     if let Some(home) = crate::util::home_dir() {
         return home.join(".config").join("thclaws").join("gui-shell");
     }
@@ -316,7 +316,7 @@ fn user_shell_dir() -> PathBuf {
 
 /// `./.thclaws/gui-shell/` — project-scoped, sits next to
 /// `./.thclaws/sessions/`. Resolved relative to current cwd at call time.
-fn project_shell_dir() -> PathBuf {
+pub fn project_shell_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".thclaws")
@@ -448,10 +448,12 @@ fn session_explorer() -> EmbeddedShell {
 /// Chatbot — minimal example shell. Sends user messages to the
 /// agent loop via `thclaws.run()`, streams replies back via
 /// `thclaws.on("text"/"done"/"error")`, persists history with
-/// `thclaws.storage`. Declares only `agent.run` permission — no
-/// tool dependencies, no MCP requirements. Works with any
-/// configured model out of the box. Reference example for shell
-/// authors who want a conversational UI.
+/// `thclaws.storage`. Declares `agent.run` plus the scoped bridge
+/// permissions its settings suite needs (model / session / memory /
+/// schedule / skills / kms / mode / profile) — no tool execution, no
+/// filesystem, no MCP requirements. Works with any configured model
+/// out of the box. Reference example for shell authors who want a
+/// conversational UI.
 fn chatbot() -> EmbeddedShell {
     build_embedded_shell(
         include_str!("../../assets/gui-shells/chatbot/manifest.json"),
@@ -481,8 +483,47 @@ fn chatbot() -> EmbeddedShell {
                 include_bytes!("../../assets/gui-shells/chatbot/AGENTS.md"),
                 "text/markdown; charset=utf-8",
             ),
+            (
+                "brand.json",
+                include_bytes!("../../assets/gui-shells/chatbot/brand.json"),
+                "application/json; charset=utf-8",
+            ),
         ],
         "chatbot",
+    )
+}
+
+/// Media Studio — image + video generation across providers
+/// (dev-plan/40 Tier 3). Drives the built-in TextToImage / ImageToImage
+/// / TextToVideo / ImageToVideo tools directly via `thclaws.callTool`;
+/// the submit tools route through the GuiApprover. Mode switch, model
+/// picker, params, gallery + lightbox.
+fn media_studio() -> EmbeddedShell {
+    build_embedded_shell(
+        include_str!("../../assets/gui-shells/media-studio/manifest.json"),
+        &[
+            (
+                "index.html",
+                include_bytes!("../../assets/gui-shells/media-studio/index.html"),
+                "text/html; charset=utf-8",
+            ),
+            (
+                "main.js",
+                include_bytes!("../../assets/gui-shells/media-studio/main.js"),
+                "application/javascript; charset=utf-8",
+            ),
+            (
+                "style.css",
+                include_bytes!("../../assets/gui-shells/media-studio/style.css"),
+                "text/css; charset=utf-8",
+            ),
+            (
+                "icon.svg",
+                include_bytes!("../../assets/gui-shells/media-studio/icon.svg"),
+                "image/svg+xml",
+            ),
+        ],
+        "media-studio",
     )
 }
 
@@ -490,6 +531,24 @@ fn chatbot() -> EmbeddedShell {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Every shipped shell's manifest must pass the same validation the
+    /// authoring tool applies. media-studio shipped with `["tool.invoke",
+    /// "storage"]` — neither is a real permission — and nothing caught it
+    /// because validation only ran on manifests written through the tool.
+    /// Undeclared perms fall back to "allow everything", so the mistake
+    /// was invisible until someone read the file.
+    #[test]
+    fn builtin_manifests_validate() {
+        for shell in ShellRegistry::builtin_only().builtin.values() {
+            if let Err(e) = shell.manifest.validate() {
+                panic!(
+                    "built-in shell '{}' has an invalid manifest: {e}",
+                    shell.manifest.id
+                );
+            }
+        }
+    }
 
     #[test]
     fn registry_resolves_session_explorer() {
@@ -512,6 +571,21 @@ mod tests {
         let names: Vec<_> = listed.iter().map(|(_, m)| m.id.as_str()).collect();
         assert!(names.contains(&"session-explorer"));
         assert!(names.contains(&"chatbot"));
+        assert!(names.contains(&"media-studio"));
+    }
+
+    #[test]
+    fn media_studio_resolves_and_ships_assets() {
+        let r = ShellRegistry::builtin_only();
+        let s = r.resolve("media-studio").expect("built-in present");
+        assert_eq!(s.manifest().id, "media-studio");
+        assert_eq!(s.source(), ShellSource::Builtin);
+        for rel in ["index.html", "main.js", "style.css", "icon.svg"] {
+            let (bytes, _) = s
+                .read_asset(rel)
+                .unwrap_or_else(|e| panic!("media-studio asset {rel}: {e}"));
+            assert!(!bytes.is_empty(), "{rel} is empty");
+        }
     }
 
     #[test]
@@ -520,10 +594,19 @@ mod tests {
         let s = r.resolve("chatbot").expect("built-in present");
         assert_eq!(s.manifest().id, "chatbot");
         assert_eq!(s.source(), ShellSource::Builtin);
-        // Must declare only the minimum permission (agent.run) — no
-        // tool / fs perms that could escalate. Important security
-        // invariant for the "minimal example" framing.
-        assert_eq!(s.manifest().permissions, vec!["agent.run".to_string()]);
+        // The shell grew a settings suite (2ef27b5d), so the permission
+        // list is no longer just `agent.run`. What still has to hold is
+        // the security invariant behind the original assertion: every
+        // permission is a scoped bridge capability — nothing that hands
+        // the shell tool execution or raw filesystem access.
+        let perms = &s.manifest().permissions;
+        assert!(perms.contains(&"agent.run".to_string()));
+        for p in perms {
+            assert!(
+                !p.starts_with("tool.") && !p.starts_with("fs.") && !p.starts_with("shell."),
+                "chatbot must not request an escalating permission: {p}"
+            );
+        }
     }
 
     #[test]

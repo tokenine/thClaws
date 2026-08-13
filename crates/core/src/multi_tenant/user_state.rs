@@ -129,18 +129,56 @@ pub struct SessionRoots {
     /// per-user usage tracker writes `<provider>/<model>.json`
     /// aggregates into.
     pub usage_dir: PathBuf,
+    /// dev-plan/42: the per-user **working directory** (project root /
+    /// cwd) the agent runs in — `<workspaces_base>/workspace-<user_id>/`.
+    /// `None` keeps the process cwd (single-tenant `--serve`, desktop,
+    /// CLI, and the dev-plan/35 shared-cwd multi-tenant layout). `Some`
+    /// is the dev-plan/42 "a workspace per user" model: the worker roots
+    /// its cwd, system prompt, skills, and todos here instead of process
+    /// cwd.
+    pub workspace_root: Option<PathBuf>,
+    /// dev-plan/45 A2: the authenticated member's user id, threaded to
+    /// the worker so every turn runs under a member scope and outbound
+    /// gateway calls carry `X-Thclaws-Member` for billing attribution.
+    pub member_id: Option<String>,
+    /// dev-plan/33: the member's HUMAN-READABLE name, from the cloud
+    /// routing layer's `X-Thclaws-User-Name`. `member_id` is an opaque
+    /// id — fine for billing attribution, useless as a greeting. A
+    /// chat shell shows this when present and shows no name at all on
+    /// desktop, where there is no login and no name to show.
+    ///
+    /// Advisory, like the member header: the id is what's signed, this
+    /// only rides along for display.
+    pub member_name: Option<String>,
 }
 
 impl SessionRoots {
-    /// Derive the three per-user roots from [`UserStatePaths`].
+    /// Derive the three per-user state roots from [`UserStatePaths`].
     /// `<user_state>.sessions_dir() / .storage_dir() / .usage_dir()`
-    /// — the canonical layout the multi-tenant doc commits to.
+    /// — the canonical layout the multi-tenant doc commits to. Leaves
+    /// `workspace_root` unset (shared-cwd / dev-plan/35 default); callers
+    /// wanting a per-user working dir set it explicitly.
     pub fn for_user_state(paths: &UserStatePaths) -> Self {
         Self {
             sessions_dir: paths.sessions_dir(),
             storage_dir: paths.storage_dir(),
             usage_dir: paths.usage_dir(),
+            workspace_root: None,
+            member_id: None,
+            member_name: None,
         }
+    }
+
+    /// Builder: record the authenticated member id (dev-plan/45 A2).
+    pub fn with_member_id(mut self, id: String) -> Self {
+        self.member_id = Some(id);
+        self
+    }
+
+    /// Builder: set the per-user working directory (dev-plan/42).
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
+        self
     }
 }
 

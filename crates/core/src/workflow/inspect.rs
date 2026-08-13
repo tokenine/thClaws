@@ -33,12 +33,12 @@ impl WorkflowStatus {
     }
 }
 
-/// Enumerate every workflow under `<cwd>/.thclaws/workflows/`. Each
+/// Enumerate every workflow run under `<cwd>/.thclaws/state/workflows/`. Each
 /// summary comes from a single forward pass over the directory's
 /// `state.jsonl`. Newest-first by id (timestamp-hex, so lexicographic
 /// = chronological).
 pub(crate) fn list_workflows(cwd: &Path) -> std::io::Result<Vec<WorkflowSummary>> {
-    let root = cwd.join(".thclaws").join("workflows");
+    let root = cwd.join(".thclaws").join("state").join("workflows");
     if !root.exists() {
         return Ok(vec![]);
     }
@@ -105,6 +105,7 @@ fn read_summary(workflow_dir: &Path, id: &str) -> std::io::Result<WorkflowSummar
 pub(crate) fn read_events(cwd: &Path, id: &str) -> std::io::Result<Vec<Value>> {
     let path = cwd
         .join(".thclaws")
+        .join("state")
         .join("workflows")
         .join(id)
         .join("state.jsonl");
@@ -118,7 +119,12 @@ pub(crate) fn read_events(cwd: &Path, id: &str) -> std::io::Result<Vec<Value>> {
 }
 
 pub(crate) fn delete_workflow(cwd: &Path, id: &str) -> std::io::Result<()> {
-    fs::remove_dir_all(cwd.join(".thclaws").join("workflows").join(id))
+    fs::remove_dir_all(
+        cwd.join(".thclaws")
+            .join("state")
+            .join("workflows")
+            .join(id),
+    )
 }
 
 /// Stage K: extract the contiguous prefix of workers that completed
@@ -172,6 +178,7 @@ pub(crate) fn read_completed_workers(
 pub(crate) fn read_workflow_script(cwd: &Path, id: &str) -> std::io::Result<String> {
     fs::read_to_string(
         cwd.join(".thclaws")
+            .join("state")
             .join("workflows")
             .join(id)
             .join("script.js"),
@@ -181,7 +188,11 @@ pub(crate) fn read_workflow_script(cwd: &Path, id: &str) -> std::io::Result<Stri
 /// Persist the approved script next to state.jsonl so a later resume
 /// can replay against the same source.
 pub(crate) fn write_workflow_script(cwd: &Path, id: &str, script: &str) -> std::io::Result<()> {
-    let dir = cwd.join(".thclaws").join("workflows").join(id);
+    let dir = cwd
+        .join(".thclaws")
+        .join("state")
+        .join("workflows")
+        .join(id);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("script.js"), script)
 }
@@ -190,11 +201,11 @@ pub(crate) fn write_workflow_script(cwd: &Path, id: &str, script: &str) -> std::
 /// Exact match wins; otherwise a unique starts-with match wins.
 /// Errors when there's no match or more than one starts-with hit.
 pub(crate) fn resolve_id_prefix(cwd: &Path, prefix: &str) -> std::io::Result<String> {
-    let root = cwd.join(".thclaws").join("workflows");
+    let root = cwd.join(".thclaws").join("state").join("workflows");
     if !root.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no .thclaws/workflows/ directory in cwd",
+            "no .thclaws/state/workflows/ directory in cwd",
         ));
     }
     let mut matches: Vec<String> = vec![];
@@ -356,6 +367,7 @@ mod tests {
         let dir = tmp
             .path()
             .join(".thclaws")
+            .join("state")
             .join("workflows")
             .join("wf-rm-me");
         assert!(dir.exists());

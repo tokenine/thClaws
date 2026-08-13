@@ -27,7 +27,22 @@ impl WorkflowSandbox {
         let mut ctx = Context::default();
         register_thclaws(&mut ctx)?;
         strip_dangerous_globals(&mut ctx)?;
+        // 47.3: always define the `args` global (null until a caller sets
+        // it via `set_args`), so a script can `if (args) …` without a
+        // ReferenceError whether or not structured input was passed.
+        ctx.register_global_property(js_string!("args"), JsValue::null(), Attribute::all())?;
         Ok(Self { ctx })
+    }
+
+    /// 47.3: install the structured `args` global the script reads —
+    /// the typed-input channel `WorkflowRun({script_path, args})` uses
+    /// instead of a `.thclaws/TASK.md` side-channel. Any JSON value.
+    pub fn set_args(&mut self, value: &serde_json::Value) -> JsResult<()> {
+        let js = JsValue::from_json(value, &mut self.ctx)?;
+        self.ctx
+            .global_object()
+            .set(js_string!("args"), js, false, &mut self.ctx)?;
+        Ok(())
     }
 
     /// Run a workflow script. Sync scripts (no `await` / `async` /
@@ -288,6 +303,25 @@ thread_local! {
     /// denied unless the target name is in `caps.kms_write`.
     static WORKFLOW_WORKER_CAPS: RefCell<Option<WorkerCaps>> = const { RefCell::new(None) };
 
+    /// Base directory that `thclaws.include` resolves relative paths
+    /// against. Captured once at workflow start (the working folder the
+    /// user launched the workflow from) so mid-run `set_current_dir`
+    /// mutations from tools can't shift the include root. `None`
+    /// outside an active workflow run — `thclaws.include` errors.
+    static WORKFLOW_INCLUDE_BASE: RefCell<Option<std::path::PathBuf>> =
+        const { RefCell::new(None) };
+
+}
+
+tokio::task_local! {
+    /// 48.1: per-future worker caps for `thclaws.parallel`. Concurrent
+    /// subagent futures interleave on the one block_on thread, so caps
+    /// can't live in `WORKFLOW_WORKER_CAPS` (a thread-local) without
+    /// bleeding across workers — a privilege-escalation bug. Each
+    /// parallel future is `.scope()`d with its own caps; the task-local
+    /// propagates through the nested tool-call tree, and
+    /// `check_kms_write_capability` prefers it over the thread-local.
+    static WORKER_CAPS_TASK: WorkerCaps;
 }
 
 // Tier 3 polish: chat-tab worker progress. When set, each
@@ -335,6 +369,17 @@ pub(crate) fn set_usage_sink(enabled: bool) {
 
 /// Called by SubAgentTool after each successful turn — no-op when the
 /// sink is disabled (i.e. outside a workflow run).
+///
+/// I3 INVARIANT: this is a thread-local sink. It works only because a
+/// workflow drives every subagent on the SAME thread that called
+/// `set_usage_sink(true)` — the sandbox runs under `spawn_blocking` and
+/// invokes each subagent via `handle.block_on(tool.call(...))`, and the
+/// model-driven concurrent path uses `join_all` (cooperative, one
+/// thread). If a future refactor moves subagent execution onto a
+/// work-stealing executor (`tokio::spawn`), this sink would silently
+/// read `None` on the worker thread and DROP all workflow usage with no
+/// error. Keep subagents on the owning thread, or switch this to a
+/// `tokio::task_local!` carried across the spawn.
 pub(crate) fn push_worker_usage(usage: crate::providers::Usage) {
     WORKFLOW_USAGE_SINK.with(|cell| {
         if let Some(vec) = cell.borrow_mut().as_mut() {
@@ -443,18 +488,27 @@ fn send_workflow_event(ev: crate::shared_session::ViewEvent) {
 /// behaviour); inside a workflow call, only KMSs named in the
 /// per-worker `caps.kms_write` set may be written.
 pub fn check_kms_write_capability(kms_name: &str) -> crate::Result<()> {
+    let deny = || {
+        crate::Error::Tool(format!(
+            "workflow: KMS write to '{kms_name}' denied — not in the worker's \
+             granted-write list. The script must pass \
+             `caps: {{kms: {{write: [\"{kms_name}\"]}}}}` to thclaws.subagent \
+             to grant write access for this call."
+        ))
+    };
+    // 48.1: a `thclaws.parallel` future carries its caps in a task-local
+    // (the thread-local would bleed across interleaved futures). Prefer it
+    // when in scope; otherwise fall back to the serial thread-local.
+    if let Ok(allowed) = WORKER_CAPS_TASK.try_with(|caps| caps.kms_write.contains(kms_name)) {
+        return if allowed { Ok(()) } else { Err(deny()) };
+    }
     WORKFLOW_WORKER_CAPS.with(|cell| match cell.borrow().as_ref() {
         None => Ok(()),
         Some(caps) => {
             if caps.kms_write.contains(kms_name) {
                 Ok(())
             } else {
-                Err(crate::Error::Tool(format!(
-                    "workflow: KMS write to '{kms_name}' denied — not in the worker's \
-                     granted-write list. The script must pass \
-                     `caps: {{kms: {{write: [\"{kms_name}\"]}}}}` to thclaws.subagent \
-                     to grant write access for this call."
-                )))
+                Err(deny())
             }
         }
     })
@@ -477,18 +531,224 @@ fn try_replay(prompt: &str) -> Option<String> {
 
 fn register_thclaws(ctx: &mut Context) -> JsResult<()> {
     let subagent_fn = NativeFunction::from_fn_ptr(subagent);
+    let include_fn = NativeFunction::from_fn_ptr(include);
+    let log_fn = NativeFunction::from_fn_ptr(workflow_log);
+    let poll_fn = NativeFunction::from_fn_ptr(poll_until);
+    let parallel_fn = NativeFunction::from_fn_ptr(parallel);
     let thclaws_obj = ObjectInitializer::new(ctx)
         .function(subagent_fn, js_string!("subagent"), 1)
+        .function(include_fn, js_string!("include"), 1)
+        .function(log_fn, js_string!("log"), 1)
+        .function(poll_fn, js_string!("pollUntil"), 2)
+        .function(parallel_fn, js_string!("parallel"), 1)
         .build();
     ctx.register_global_property(js_string!("thclaws"), thclaws_obj, Attribute::READONLY)
+}
+
+/// Host implementation of `thclaws.log(msg)` — a narrator line for
+/// workflow observability. `console` is stripped from the sandbox, so
+/// this is the blessed channel for a script to surface progress between
+/// stages. Prints to stdout (REPL + headless authoring/debugging) and,
+/// under the GUI, emits a one-line chat indicator the same shape workers
+/// use. Returns `undefined`; never throws (a missing arg logs empty).
+fn workflow_log(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let msg = args
+        .get_or_undefined(0)
+        .to_string(ctx)
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    use std::io::Write as _;
+    println!("  · {msg}");
+    let _ = std::io::stdout().flush();
+    #[cfg(feature = "gui")]
+    {
+        let label = format!("log: {}", crate::tool_display::sanitize_label_field(&msg));
+        send_workflow_event(crate::shared_session::ViewEvent::ToolCallStart {
+            name: "WorkflowLog".to_string(),
+            label,
+            input: serde_json::json!({}),
+        });
+        send_workflow_event(crate::shared_session::ViewEvent::ToolCallResult {
+            name: "WorkflowLog".to_string(),
+            output: msg,
+            ui_resource: None,
+        });
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Host implementation of `thclaws.pollUntil(checkFn, opts)` (dev-plan/48.5)
+/// — the submit→poll→done shape async jobs (image/video/TTS) repeat. Calls
+/// `checkFn()` every `opts.interval` until `opts.until(result)` is truthy (or
+/// `result` itself is truthy when no `until` is given), returns that result;
+/// throws on `opts.timeout`. Bounded + cancellation-aware (same Stop token as
+/// `subagent`). `checkFn` is synchronous from the host's view — it may call
+/// `thclaws.subagent(...)` (which blocks internally) and return its value.
+///
+/// ```js
+/// const done = await thclaws.pollUntil(
+///   () => thclaws.subagent({ agent: "job-poller", prompt: jobId }),
+///   { interval: "10s", timeout: "10m", until: r => r.state === "done" });
+/// ```
+fn poll_until(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(check_fn) = args.get_or_undefined(0).as_callable() else {
+        return Err(js_error(
+            "thclaws.pollUntil: first argument must be a function",
+        ));
+    };
+
+    let mut interval = std::time::Duration::from_secs(5);
+    let mut timeout = std::time::Duration::from_secs(300);
+    let mut until_fn: Option<boa_engine::JsObject> = None;
+    if let Some(o) = args.get_or_undefined(1).as_object() {
+        if let Ok(v) = o.get(js_string!("interval"), ctx) {
+            if let Some(d) = value_to_duration(&v) {
+                interval = d;
+            }
+        }
+        if let Ok(v) = o.get(js_string!("timeout"), ctx) {
+            if let Some(d) = value_to_duration(&v) {
+                timeout = d;
+            }
+        }
+        if let Ok(v) = o.get(js_string!("until"), ctx) {
+            until_fn = v.as_callable();
+        }
+    }
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Err(js_error("thclaws.pollUntil: no tokio runtime available"));
+    };
+    let cancel = workflow_cancel_clone();
+    let start = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        if let Some(tok) = cancel.as_ref() {
+            if tok.is_cancelled() {
+                return Err(js_error(WORKFLOW_CANCELLED_MSG));
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(js_error(&format!(
+                "thclaws.pollUntil: timed out after {} ({attempt} poll(s))",
+                crate::tool_display::format_duration(timeout)
+            )));
+        }
+        attempt += 1;
+        let result = check_fn.call(&JsValue::undefined(), &[], ctx)?;
+        let done = match &until_fn {
+            Some(f) => f
+                .call(&JsValue::undefined(), &[result.clone()], ctx)?
+                .to_boolean(),
+            None => result.to_boolean(),
+        };
+        if done {
+            return Ok(result);
+        }
+        // Sleep one interval, racing the Stop token so a poll loop aborts promptly.
+        match cancel.as_ref() {
+            Some(tok) => handle.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = tok.cancelled() => {}
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            }),
+            None => handle.block_on(tokio::time::sleep(interval)),
+        }
+    }
+}
+
+/// Install (or clear with `None`) the base directory that
+/// `thclaws.include` resolves relative paths against. Called by the
+/// workflow runners right before / after `spawn_blocking` so the
+/// thread-local lives exactly for one run.
+pub(crate) fn set_include_base(base: Option<std::path::PathBuf>) {
+    WORKFLOW_INCLUDE_BASE.with(|c| *c.borrow_mut() = base);
+}
+
+/// Host implementation of `thclaws.include(path)` — reads a script
+/// file and evaluates it in the same Boa Context, so any top-level
+/// `globalThis.foo = …` definitions become available to the caller.
+///
+/// Path validation:
+///   - Absolute paths → rejected (must be relative).
+///   - `..` traversal that resolves outside the base → rejected.
+///   - Symlinks that resolve outside the base → rejected (via
+///     `canonicalize`, which follows them before the prefix check).
+///
+/// Returns the included script's final expression value. Lifecycle
+/// errors (no base, bad path, file missing, parse failure) bubble up
+/// as a JS exception so the calling script can `try`/`catch`.
+fn include(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let raw = match args.get_or_undefined(0).as_string() {
+        Some(s) => s.to_std_string_escaped(),
+        None => return Err(js_error("thclaws.include: requires a path string")),
+    };
+    let path = std::path::PathBuf::from(&raw);
+    if path.is_absolute() {
+        return Err(js_error(&format!(
+            "thclaws.include: absolute paths not allowed (got '{raw}')"
+        )));
+    }
+    let base = match WORKFLOW_INCLUDE_BASE.with(|c| c.borrow().clone()) {
+        Some(b) => b,
+        None => {
+            return Err(js_error(
+                "thclaws.include: no working folder bound (not inside a workflow run)",
+            ));
+        }
+    };
+    // Resolve under the captured base. canonicalize on the joined
+    // path so `..` and symlinks are followed before the prefix check,
+    // otherwise `../etc/passwd` could slip past by spelling.
+    let joined = base.join(&path);
+    let resolved = joined.canonicalize().map_err(|e| {
+        js_error(&format!(
+            "thclaws.include: can't resolve '{raw}' under {}: {e}",
+            base.display()
+        ))
+    })?;
+    let base_canonical = base.canonicalize().unwrap_or_else(|_| base.clone());
+    if !resolved.starts_with(&base_canonical) {
+        return Err(js_error(&format!(
+            "thclaws.include: '{raw}' resolves outside the working folder ({})",
+            base_canonical.display()
+        )));
+    }
+    let content = std::fs::read_to_string(&resolved).map_err(|e| {
+        js_error(&format!(
+            "thclaws.include: can't read '{}': {e}",
+            resolved.display()
+        ))
+    })?;
+    ctx.eval(boa_engine::Source::from_bytes(&content))
+        .map_err(|e| js_error(&format!("thclaws.include: '{raw}' failed: {e}")))
 }
 
 fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let prompt = extract_prompt(args, ctx);
     let budget = extract_budget(args, ctx);
-    let schema = extract_schema(args, ctx);
+    let per_call_schema = extract_schema(args, ctx);
     let retry = extract_retry(args, ctx);
     let caps = extract_caps(args, ctx);
+    // `agent: "name"` picks a subagent definition from
+    // `.thclaws/agents/<name>.md` — matches the model-driven Task
+    // tool's `agent` param. Forwarded into the Task tool input below;
+    // an unknown name surfaces as a worker failure (Task tool
+    // validates against AgentDefsConfig).
+    let agent_name = extract_agent_name(args, ctx);
+
+    let task_tool = WORKFLOW_TASK_TOOL.with(|c| c.borrow().clone());
+
+    // 47.1: when the call omits an explicit `schema`, fall back to the
+    // named agent's declared `output_schema` (from its `.md`), so the
+    // contract lives in one place (the def) instead of being duplicated
+    // in the workflow JS. An explicit per-call `schema` still wins.
+    let schema = per_call_schema.or_else(|| {
+        let name = agent_name.as_ref()?;
+        task_tool.as_ref()?.subagent_output_schema(name)
+    });
 
     // Stage K: serve from the replay cache when this call's prompt
     // matches the next pending entry. No worker_start/worker_done
@@ -520,12 +780,21 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         }
     }
 
-    let task_tool = WORKFLOW_TASK_TOOL.with(|c| c.borrow().clone());
-
     let Some(tool) = task_tool else {
-        // Stage A fallback: no Task tool wired (tests, GUI refusal path)
-        // — echo the prompt so callers get a deterministic placeholder
-        // instead of an error.
+        // 47.6 surface guard: inside a REAL workflow run (usage sink set)
+        // with no Task tool, the current surface can't spawn subagents
+        // (e.g. `-p` / `/v1`, where Task isn't registered). Fail LOUD
+        // rather than returning a stub the script would treat as a real
+        // worker result — the silent-role-play footgun the best-practice
+        // guide warns about. Outside a workflow run (sandbox eval in
+        // tests / the GUI refusal preview) keep the deterministic stub.
+        if is_inside_workflow() {
+            return Err(js_error(
+                "thclaws.subagent: no Task tool on this surface — subagent calls aren't \
+                 available here (this is the `-p` / `/v1` footgun). Run the workflow on \
+                 `--cli`, `--serve`, or the GUI, where the Task tool is registered.",
+            ));
+        }
         return Ok(JsValue::from(js_string!(
             format!("(stub for: {prompt})").as_str()
         )));
@@ -608,13 +877,25 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     }
 
     // Stage H retry loop. Always at least 1 attempt; up to retry.max
-    // total. Sleeps between attempts according to retry.backoff.
-    let input = serde_json::json!({ "prompt": augmented_prompt });
+    // total. Sleeps between attempts according to retry.backoff. On a retry
+    // after a FIXABLE (schema / non-JSON) failure, `feedback` carries the exact
+    // rejection reason into the next attempt's prompt — telling the model what
+    // was wrong beats re-rolling the same prompt blind, and helps weaker models
+    // recover a slipped output shape in one retry instead of burning attempts.
+    let mut feedback: Option<String> = None;
     let mut last_failure: Option<String> = None;
     let mut last_text_for_done: Option<String> = None;
     let mut parsed_json: Option<serde_json::Value> = None;
     let mut succeeded = false;
-    let max_attempts = retry.max.max(1);
+    // Transient provider/stream errors (e.g. a dropped SSE during a
+    // parallel fan-out) retry up to this floor even when the script set
+    // no `retry:` — a single flaky stream shouldn't kill the worker.
+    // Deterministic failures (schema, token budget) still honor
+    // `retry.max`.
+    const TRANSIENT_RETRY_FLOOR: u32 = 3;
+    let deterministic_max = retry.max.max(1);
+    let max_attempts = deterministic_max.max(TRANSIENT_RETRY_FLOOR);
+    let mut attempts_used = 0u32;
     // Stop-button: a clone of the host's CancelToken (None in REPL/
     // headless today). Polled before each attempt and raced against
     // the in-flight `tool.call` via `tokio::select!`. When cancel
@@ -622,6 +903,7 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     // detect to render a friendlier "stopped" message.
     let cancel = workflow_cancel_clone();
     for attempt in 1..=max_attempts {
+        attempts_used = attempt;
         if let Some(tok) = cancel.as_ref() {
             if tok.is_cancelled() {
                 return Err(js_error(WORKFLOW_CANCELLED_MSG));
@@ -630,6 +912,22 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         // Clear per-attempt state so a prior failure doesn't shadow a
         // later success.
         last_failure = None;
+        // Build THIS attempt's prompt. First try (or after a transient error)
+        // uses the plain schema-augmented prompt; a retry after a fixable
+        // failure appends the exact reason so the model corrects it rather than
+        // re-rolling blind.
+        let attempt_prompt = match &feedback {
+            Some(err) => format!(
+                "{augmented_prompt}\n\nYour previous attempt was REJECTED — {err}\n\
+                 Return a corrected JSON value that fixes exactly that. Same task, \
+                 valid output this time — no prose, no markdown fences."
+            ),
+            None => augmented_prompt.clone(),
+        };
+        let input = match &agent_name {
+            Some(name) => serde_json::json!({ "prompt": attempt_prompt, "agent": name }),
+            None => serde_json::json!({ "prompt": attempt_prompt }),
+        };
         // Stage G/M: enforce time budget per-attempt + install
         // per-worker capabilities for KMS write gating. Caps live
         // only for the duration of this tool.call so nested model-
@@ -686,24 +984,36 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
                 // last entry. Post-hoc enforcement only — we can't
                 // abort mid-stream — so this acts as a soft cap that
                 // triggers retry on the next iteration.
+                //
+                // Count OUTPUT tokens only — this is a runaway-GENERATION
+                // guard, not a total-cost cap. The worker's input is fixed
+                // by the task (its prompt + whatever it reads), and on a
+                // large-context model that input alone is tens of thousands
+                // of tokens, so counting it would falsely kill normal
+                // workers (a worker that just reads a file would "exceed"
+                // any modest cap before producing anything).
                 if let Some(token_cap) = budget.tokens {
                     if let Some(u) = last_worker_usage() {
-                        let used = (u.input_tokens + u.output_tokens) as u64;
+                        let used = u.output_tokens as u64;
                         if used > token_cap {
                             last_failure = Some(format!(
-                                "worker exceeded token budget of {token_cap} (used {used})"
+                                "worker exceeded output-token budget of {token_cap} (generated {used})"
                             ));
-                            if attempt < max_attempts {
-                                if let Some(wid) = worker_id {
-                                    let prior_err = last_failure.clone().unwrap_or_default();
-                                    super::state::with_logger(|l| {
-                                        let _ = l.worker_retry(wid, attempt, &prior_err);
-                                    });
-                                }
-                                let delay = retry.delay_for_attempt(attempt);
-                                if !delay.is_zero() {
-                                    handle.block_on(tokio::time::sleep(delay));
-                                }
+                            // Budget overrun is deterministic — honor the
+                            // script's `retry.max`, don't spend the
+                            // transient floor re-running a too-chatty worker.
+                            if attempt >= deterministic_max {
+                                break;
+                            }
+                            if let Some(wid) = worker_id {
+                                let prior_err = last_failure.clone().unwrap_or_default();
+                                super::state::with_logger(|l| {
+                                    let _ = l.worker_retry(wid, attempt, &prior_err);
+                                });
+                            }
+                            let delay = retry.delay_for_attempt(attempt);
+                            if !delay.is_zero() {
+                                handle.block_on(tokio::time::sleep(delay));
                             }
                             continue;
                         }
@@ -748,6 +1058,24 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
             }
         }
 
+        // Past the script's explicit retry budget, reserve the remaining
+        // attempts for transient provider/stream errors only — re-running
+        // a deterministic failure (schema mismatch) just burns tokens.
+        let is_transient = last_failure
+            .as_deref()
+            .map(super::is_transient_provider_error)
+            .unwrap_or(false);
+        // Carry a FIXABLE failure (schema / non-JSON) into the next attempt's
+        // prompt as feedback; a transient stream error isn't the model's fault,
+        // so leave the prompt clean and just re-roll.
+        feedback = if is_transient {
+            None
+        } else {
+            last_failure.clone()
+        };
+        if attempt >= deterministic_max && !is_transient {
+            break;
+        }
         if attempt < max_attempts {
             if let Some(wid) = worker_id {
                 let prior_err = last_failure.clone().unwrap_or_default();
@@ -809,7 +1137,7 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     if !success {
         let err_msg = last_failure.unwrap_or_else(|| "unknown error".to_string());
         return Err(js_error(&format!(
-            "workflow subagent failed after {max_attempts} attempt(s): {err_msg}"
+            "workflow subagent failed after {attempts_used} attempt(s): {err_msg}"
         )));
     }
     let text = last_text_for_done.unwrap();
@@ -823,12 +1151,269 @@ fn subagent(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     }
 }
 
+enum WorkerOut {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+/// 48.1: `thclaws.parallel(specs)` — run an array of subagent specs
+/// CONCURRENTLY. This is the only genuine fan-out primitive in the
+/// workflow runtime: plain `Promise.all` over `thclaws.subagent` still
+/// runs serially because that host call blocks on each spawn. Each spec
+/// is the same `{prompt, agent?, schema?, caps?, budget?, fallback?}`
+/// object `thclaws.subagent` takes; results come back as an array in
+/// input order (parsed JSON when a schema / def output_schema applies,
+/// else the worker's text).
+///
+/// **Settle semantics (not Promise.all):** a worker that fails after its
+/// transient retries does NOT abort the batch — that item becomes the
+/// spec's `fallback` value (default `null`), so partial results are
+/// preserved (a 50-item render where 1 worker dies keeps the other 49).
+/// This mirrors the graceful `step(opts, fallback)` pattern batch agents
+/// want. The call only throws on a programmer error (arg not an array, no
+/// Task tool on this surface), never on a worker error.
+///
+/// Concurrency is capped at `min(16, cores-2)`. Each future is `.scope`d
+/// with its own caps via a tokio task-local (`WORKER_CAPS_TASK`) so a
+/// per-worker KMS-write grant can't bleed across interleaved futures.
+/// The parallel path deliberately skips the per-worker token-budget
+/// soft-cap and replay-cache that `thclaws.subagent` applies (total
+/// usage is still metered for billing).
+fn parallel(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(arr_obj) = args.get_or_undefined(0).as_object() else {
+        return Err(js_error(
+            "thclaws.parallel: first argument must be an array of subagent specs",
+        ));
+    };
+    if !arr_obj.is_array() {
+        return Err(js_error(
+            "thclaws.parallel: first argument must be an array of subagent specs",
+        ));
+    }
+    let len = arr_obj.get(js_string!("length"), ctx)?.to_number(ctx)? as usize;
+
+    let task_tool = WORKFLOW_TASK_TOOL.with(|c| c.borrow().clone());
+
+    struct PSpec {
+        input: serde_json::Value,
+        schema: Option<serde_json::Value>,
+        caps: WorkerCaps,
+        time: Option<std::time::Duration>,
+        prompt: String,
+    }
+    // Parse all specs up front (needs &mut Context — can't cross into the
+    // async block, where `ctx` isn't available). `fallbacks` runs parallel to
+    // `specs` (same index) so the collect loop can substitute on a worker error.
+    let mut specs: Vec<PSpec> = Vec::with_capacity(len);
+    let mut fallbacks: Vec<serde_json::Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        let spec_val = arr_obj.get(i as u32, ctx)?;
+        let one = [spec_val];
+        let prompt = extract_prompt(&one, ctx);
+        let budget = extract_budget(&one, ctx);
+        let caps = extract_caps(&one, ctx);
+        let agent_name = extract_agent_name(&one, ctx);
+        let fallback = one
+            .first()
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get(js_string!("fallback"), ctx).ok())
+            .and_then(|v| v.to_json(ctx).ok().flatten())
+            .unwrap_or(serde_json::Value::Null);
+        fallbacks.push(fallback);
+        let schema = extract_schema(&one, ctx).or_else(|| {
+            let name = agent_name.as_ref()?;
+            task_tool.as_ref()?.subagent_output_schema(name)
+        });
+        let augmented = match &schema {
+            Some(s) => format!(
+                "{prompt}\n\nReturn ONLY a JSON value matching this JSON Schema. \
+                 No prose, no markdown fences:\n{s}"
+            ),
+            None => prompt.clone(),
+        };
+        let input = match &agent_name {
+            Some(name) => serde_json::json!({ "prompt": augmented, "agent": name }),
+            None => serde_json::json!({ "prompt": augmented }),
+        };
+        specs.push(PSpec {
+            input,
+            schema,
+            caps,
+            time: budget.time,
+            prompt,
+        });
+    }
+
+    let Some(tool) = task_tool else {
+        if is_inside_workflow() {
+            return Err(js_error(
+                "thclaws.parallel: no Task tool on this surface — subagent calls aren't \
+                 available here (the `-p` / `/v1` footgun). Run on `--cli`, `--serve`, or the GUI.",
+            ));
+        }
+        // Outside a real run (sandbox eval in tests): deterministic stubs.
+        let stubs: Vec<serde_json::Value> = specs
+            .iter()
+            .map(|s| serde_json::Value::String(format!("(stub for: {})", s.prompt)))
+            .collect();
+        return JsValue::from_json(&serde_json::Value::Array(stubs), ctx);
+    };
+
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| js_error("workflow: no tokio runtime available for parallel spawn"))?;
+    let cancel = workflow_cancel_clone();
+    // Subagent fan-out is I/O-bound: every parallel future just awaits the
+    // gateway/LLM on the single `block_on` thread, so the ceiling is the
+    // gateway's tolerance, NOT local CPU. The old `cores-2` heuristic was a
+    // CPU-bound-work metric misapplied here — on a cpu-limited cloud runner
+    // (`available_parallelism()==1`) it collapsed to 1 and silently
+    // serialized every `thclaws.parallel` stage (searchers, synthesizers,
+    // reviewers all ran one-at-a-time). Use an I/O-appropriate fixed default,
+    // overridable via THCLAWS_WORKFLOW_PARALLELISM for gateways with tighter
+    // (or looser) concurrency budgets.
+    let cap = std::env::var("THCLAWS_WORKFLOW_PARALLELISM")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(8)
+        .clamp(1, 32);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+
+    let results: Vec<Result<WorkerOut, String>> = handle.block_on(async move {
+        let futs = specs.into_iter().map(|s| {
+            let tool = tool.clone();
+            let sem = sem.clone();
+            let cancel = cancel.clone();
+            async move {
+                let _permit = sem.acquire().await.ok();
+                WORKER_CAPS_TASK
+                    .scope(
+                        s.caps,
+                        run_one_parallel(tool, s.input, s.schema, s.time, cancel),
+                    )
+                    .await
+            }
+        });
+        futures::future::join_all(futs).await
+    });
+
+    // Settle: a failed worker becomes its `fallback` (default null) so the
+    // batch keeps every successful result. Never throws on a worker error.
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(results.len());
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(WorkerOut::Json(v)) => out.push(v),
+            Ok(WorkerOut::Text(t)) => out.push(serde_json::Value::String(t)),
+            Err(e) => {
+                failed.push((i, e));
+                out.push(fallbacks.get(i).cloned().unwrap_or(serde_json::Value::Null));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        use std::io::Write as _;
+        println!(
+            "  · thclaws.parallel: {}/{} worker(s) failed → fallback (first: #{} {})",
+            failed.len(),
+            out.len(),
+            failed[0].0,
+            failed[0].1.chars().take(120).collect::<String>()
+        );
+        let _ = std::io::stdout().flush();
+    }
+    JsValue::from_json(&serde_json::Value::Array(out), ctx)
+}
+
+/// One parallel worker: tool.call with optional time budget + cancel,
+/// a small transient retry, and schema validation. Runs inside the
+/// caller's `WORKER_CAPS_TASK` scope (so KMS-write gating sees this
+/// worker's caps, not a neighbour's).
+async fn run_one_parallel(
+    tool: Arc<dyn crate::tools::Tool>,
+    input: serde_json::Value,
+    schema: Option<serde_json::Value>,
+    time: Option<std::time::Duration>,
+    cancel: Option<crate::cancel::CancelToken>,
+) -> Result<WorkerOut, String> {
+    let compiled = match &schema {
+        Some(s) => Some(jsonschema::validator_for(s).map_err(|e| format!("invalid schema: {e}"))?),
+        None => None,
+    };
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::from("worker produced no result");
+    for _ in 1..=MAX_ATTEMPTS {
+        if let Some(tok) = cancel.as_ref() {
+            if tok.is_cancelled() {
+                return Err(WORKFLOW_CANCELLED_MSG.into());
+            }
+        }
+        let call = tool.call(input.clone());
+        let result: crate::Result<String> = match (time, cancel.as_ref()) {
+            (Some(t), Some(tok)) => tokio::select! {
+                biased;
+                _ = tok.cancelled() => Err(crate::Error::Agent(WORKFLOW_CANCELLED_MSG.into())),
+                r = tokio::time::timeout(t, call) => r.unwrap_or_else(|_| Err(crate::Error::Agent(format!(
+                    "worker exceeded time budget of {}", crate::tool_display::format_duration(t))))),
+            },
+            (Some(t), None) => tokio::time::timeout(t, call).await.unwrap_or_else(|_| {
+                Err(crate::Error::Agent(format!(
+                    "worker exceeded time budget of {}",
+                    crate::tool_display::format_duration(t)
+                )))
+            }),
+            (None, Some(tok)) => tokio::select! {
+                biased;
+                _ = tok.cancelled() => Err(crate::Error::Agent(WORKFLOW_CANCELLED_MSG.into())),
+                r = call => r,
+            },
+            (None, None) => call.await,
+        };
+        match result {
+            Ok(text) => match &compiled {
+                Some(v) => match extract_json_from_text(&text) {
+                    Some(jv) if v.is_valid(&jv) => return Ok(WorkerOut::Json(jv)),
+                    _ => {
+                        last_err = "worker output did not match the schema".into();
+                        continue;
+                    }
+                },
+                None => return Ok(WorkerOut::Text(text)),
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 fn extract_prompt(args: &[JsValue], ctx: &mut Context) -> String {
     let arg = args.get_or_undefined(0);
     arg.as_object()
         .and_then(|obj| obj.get(js_string!("prompt"), ctx).ok())
         .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
         .unwrap_or_else(|| "(no prompt)".to_string())
+}
+
+/// Pull `agent: "name"` from the opts object. `None` when the field is
+/// absent / empty / non-string; the Task tool then falls back to the
+/// default agent. A non-empty string is forwarded verbatim — the Task
+/// tool validates it against the loaded `AgentDefsConfig`.
+fn extract_agent_name(args: &[JsValue], ctx: &mut Context) -> Option<String> {
+    let arg = args.get_or_undefined(0).as_object()?;
+    let v = arg.get(js_string!("agent"), ctx).ok()?;
+    if v.is_undefined() || v.is_null() {
+        return None;
+    }
+    let s = v.as_string()?.to_std_string_escaped();
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Default)]
@@ -1436,6 +2021,337 @@ paths.map((p, i) => `${p} — ${summaries[i]}`).join("\n");"#;
         assert_eq!(result.unwrap(), "2:a,b");
     }
 
+    /// 48.1: `thclaws.parallel` runs specs CONCURRENTLY (wall-clock ≈ the
+    /// slowest worker, not the sum) and returns results in input order.
+    #[tokio::test]
+    async fn parallel_runs_concurrently_and_preserves_order() {
+        struct EchoTask;
+        #[async_trait]
+        impl Tool for EchoTask {
+            fn name(&self) -> &'static str {
+                "echo"
+            }
+            fn description(&self) -> &'static str {
+                "echo the prompt after a delay"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, input: Value) -> crate::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                Ok(input
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string())
+            }
+        }
+        let mock: Arc<dyn Tool> = Arc::new(EchoTask);
+        let script = r#"
+            const rs = thclaws.parallel([{ prompt: "a" }, { prompt: "b" }, { prompt: "c" }]);
+            rs.join(",")
+        "#
+        .to_string();
+        let (result, elapsed) = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            set_usage_sink(true);
+            let start = std::time::Instant::now();
+            let r = WorkflowSandbox::new()
+                .unwrap()
+                .run(&script)
+                .map_err(|e| e.to_string());
+            let el = start.elapsed();
+            set_usage_sink(false);
+            set_task_tool(None);
+            (r, el)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.unwrap(),
+            "a,b,c",
+            "results must come back in input order"
+        );
+        // 3 workers × 60ms each: serial would be ~180ms; concurrent ~60ms.
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "expected concurrency, took {elapsed:?}"
+        );
+    }
+
+    /// dev-plan/50: a failed worker settles to its `fallback` (default null)
+    /// instead of aborting the batch — partial results are preserved.
+    #[tokio::test]
+    async fn parallel_settles_failed_worker_to_fallback() {
+        struct FlakyTask;
+        #[async_trait]
+        impl Tool for FlakyTask {
+            fn name(&self) -> &'static str {
+                "flaky"
+            }
+            fn description(&self) -> &'static str {
+                "ok unless prompt contains BOOM"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, input: Value) -> crate::Result<String> {
+                let p = input.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                if p.contains("BOOM") {
+                    Err(crate::Error::Agent("boom".into()))
+                } else {
+                    Ok(p.to_string())
+                }
+            }
+        }
+        let mock: Arc<dyn Tool> = Arc::new(FlakyTask);
+        let script = r#"
+            const rs = thclaws.parallel([
+              { prompt: "a" },
+              { prompt: "BOOM", fallback: { failed: true } },
+              { prompt: "c" }
+            ]);
+            JSON.stringify(rs)
+        "#
+        .to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            set_usage_sink(true);
+            let r = WorkflowSandbox::new()
+                .unwrap()
+                .run(&script)
+                .map_err(|e| e.to_string());
+            set_usage_sink(false);
+            set_task_tool(None);
+            r
+        })
+        .await
+        .unwrap();
+        // Successful workers keep their values; the failed one gets its fallback.
+        assert_eq!(result.unwrap(), r#"["a",{"failed":true},"c"]"#);
+    }
+
+    /// 47.4: `thclaws.log()` is callable, returns undefined, and doesn't
+    /// disturb the script's result (it's a side-effecting narrator).
+    #[test]
+    fn log_is_callable_and_returns_undefined() {
+        let mut sb = WorkflowSandbox::new().unwrap();
+        let out = sb
+            .run(r#"const r = thclaws.log("stage 1 done"); `${r === undefined}`"#)
+            .unwrap();
+        assert_eq!(out, "true");
+    }
+
+    /// 48.5: `thclaws.pollUntil` calls the check fn until `until` is truthy,
+    /// returns that result; and throws on timeout.
+    #[tokio::test]
+    async fn poll_until_polls_then_returns_and_times_out() {
+        let ok_script = r#"
+            let n = 0;
+            const r = thclaws.pollUntil(() => { n = n + 1; return { n: n }; },
+                                        { interval: "1ms", timeout: "5s", until: (r) => r.n >= 3 });
+            `${r.n}`
+        "#
+        .to_string();
+        let got = tokio::task::spawn_blocking(move || {
+            WorkflowSandbox::new()
+                .unwrap()
+                .run(&ok_script)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.unwrap(), "3");
+
+        let timeout_script =
+            r#"thclaws.pollUntil(() => ({ done: false }), { interval: "2ms", timeout: "15ms", until: (r) => r.done })"#
+                .to_string();
+        let err = tokio::task::spawn_blocking(move || {
+            WorkflowSandbox::new()
+                .unwrap()
+                .run(&timeout_script)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(err.contains("timed out"), "expected timeout, got: {err}");
+    }
+
+    /// 47.3: `args` defaults to null, and `set_args` exposes structured
+    /// input the script reads directly.
+    #[test]
+    fn args_global_defaults_null_and_set_args_exposes_input() {
+        let mut sb = WorkflowSandbox::new().unwrap();
+        assert_eq!(sb.run("String(args)").unwrap(), "null");
+
+        let mut sb2 = WorkflowSandbox::new().unwrap();
+        sb2.set_args(&serde_json::json!({"query": "obon", "n": 3}))
+            .unwrap();
+        assert_eq!(sb2.run(r#"`${args.query}:${args.n}`"#).unwrap(), "obon:3");
+    }
+
+    /// 47.1: a `thclaws.subagent({agent})` call with NO per-call schema
+    /// picks up the agent def's declared `output_schema` (surfaced via
+    /// the Task tool's `subagent_output_schema`) and returns parsed JSON.
+    #[tokio::test]
+    async fn agent_output_schema_applied_when_call_omits_schema() {
+        struct SchemaAgentTask;
+        #[async_trait]
+        impl Tool for SchemaAgentTask {
+            fn name(&self) -> &'static str {
+                "Task"
+            }
+            fn description(&self) -> &'static str {
+                "schema-on-def mock"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            fn subagent_output_schema(&self, agent: &str) -> Option<Value> {
+                (agent == "planner").then(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {"goal": {"type": "string"}},
+                        "required": ["goal"]
+                    })
+                })
+            }
+            async fn call(&self, _input: Value) -> crate::Result<String> {
+                Ok(r#"{"goal": "map the topic"}"#.into())
+            }
+        }
+        let mock: Arc<dyn Tool> = Arc::new(SchemaAgentTask);
+        // No `schema:` on the call — it must come from the agent def.
+        let script = r#"
+            const r = thclaws.subagent({ agent: "planner", prompt: "plan it" });
+            r.goal
+        "#
+        .to_string();
+        let result: std::result::Result<String, String> = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sb = WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sb.run(&script).map_err(|e| e.to_string())
+            })();
+            set_task_tool(None);
+            res
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "map the topic");
+    }
+
+    /// 47.6: inside a real workflow run (usage sink set) with no Task
+    /// tool wired, `thclaws.subagent` fails loud instead of returning a
+    /// stub the script would mistake for a real worker result.
+    #[test]
+    fn subagent_fails_loud_when_no_task_tool_inside_workflow() {
+        set_usage_sink(true);
+        set_task_tool(None);
+        let mut sb = WorkflowSandbox::new().unwrap();
+        let err = sb
+            .run(r#"thclaws.subagent({prompt: "x"})"#)
+            .unwrap_err()
+            .to_string();
+        set_usage_sink(false);
+        assert!(
+            err.contains("no Task tool") || err.contains("footgun"),
+            "expected a loud surface error, got: {err}"
+        );
+    }
+
+    /// `thclaws.include` resolves relative paths under the captured
+    /// working folder. Three sub-cases bundled in one test:
+    ///   1. happy path — file in cwd loads + defines a global the caller reads
+    ///   2. absolute path → rejected
+    ///   3. `..` escaping the base → rejected
+    #[test]
+    fn include_resolves_under_working_folder_and_blocks_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helpers.js"), "globalThis.helperValue = 7;").unwrap();
+        set_include_base(Some(dir.path().to_path_buf()));
+
+        // Happy path.
+        let mut sb = WorkflowSandbox::new().unwrap();
+        let out = sb
+            .run(r#"thclaws.include("helpers.js"); String(globalThis.helperValue);"#)
+            .unwrap();
+        assert_eq!(out, "7");
+
+        // Absolute paths are rejected before any IO.
+        let abs = format!(
+            "thclaws.include({:?});",
+            dir.path().join("helpers.js").to_string_lossy()
+        );
+        let err = sb.run(&abs).unwrap_err().to_string();
+        assert!(err.contains("absolute paths not allowed"), "got: {err}");
+
+        // `..` traversal canonicalizes outside the base → rejected.
+        let err2 = sb
+            .run(r#"thclaws.include("../escape.js");"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err2.contains("resolves outside") || err2.contains("can't resolve"),
+            "got: {err2}"
+        );
+
+        set_include_base(None);
+    }
+
+    /// `thclaws.subagent({prompt, agent: "name"})` must forward the
+    /// `agent` field into the Task tool input so the parent's
+    /// AgentDefsConfig can swap in the matching .thclaws/agents/<name>.md
+    /// definition — same shape the LLM-driven Task tool already accepts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_param_forwards_to_task_tool_input() {
+        struct EchoAgentTask;
+        #[async_trait]
+        impl Tool for EchoAgentTask {
+            fn name(&self) -> &'static str {
+                "Task"
+            }
+            fn description(&self) -> &'static str {
+                "echoes the agent field"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, input: Value) -> crate::Result<String> {
+                Ok(input
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<absent>")
+                    .to_string())
+            }
+        }
+
+        let mock: Arc<dyn Tool> = Arc::new(EchoAgentTask);
+        // First call passes agent: "reviewer"; second omits it so we
+        // can assert the conditional branch in `subagent()` doesn't
+        // inject an empty value.
+        let script = r#"
+            const a = thclaws.subagent({prompt: "review", agent: "reviewer"});
+            const b = thclaws.subagent({prompt: "no agent"});
+            `${a}|${b}`
+        "#;
+        let mock_clone = mock.clone();
+        let result: std::result::Result<String, String> = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock_clone));
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sb = WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sb.run(script).map_err(|e| e.to_string())
+            })();
+            set_task_tool(None);
+            res
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.unwrap(), "reviewer|<absent>");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn schema_failure_triggers_retry_then_succeeds() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1514,8 +2430,10 @@ paths.map((p, i) => `${p} — ${summaries[i]}`).join("\n");"#;
                 // (real Tool wires this through SubAgentTool::call;
                 // this mock does it directly so the test stays local).
                 crate::workflow::push_worker_usage(crate::providers::Usage {
-                    input_tokens: 800,
-                    output_tokens: 400,
+                    // Huge input (like a 1M-context worker that read a big
+                    // file) but it's IGNORED — only output is capped.
+                    input_tokens: 50_000,
+                    output_tokens: 600,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
                     reasoning_output_tokens: None,
@@ -1562,6 +2480,73 @@ paths.map((p, i) => `${p} — ${summaries[i]}`).join("\n");"#;
             "expected token-budget error: {msg}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_budget_ignores_large_input_context() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Regression for the reported /workflow failure: a worker on a
+        // large-context model that READ a lot (huge input) but generated
+        // little must NOT be killed by a modest token budget — the cap is
+        // output-only, so its input never counts against it.
+        struct ReadHeavyTask {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl Tool for ReadHeavyTask {
+            fn name(&self) -> &'static str {
+                "Task"
+            }
+            fn description(&self) -> &'static str {
+                "read-heavy mock"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, _input: Value) -> crate::Result<String> {
+                crate::workflow::push_worker_usage(crate::providers::Usage {
+                    input_tokens: 57_529, // mostly input, like the reported run
+                    output_tokens: 1_200,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_output_tokens: None,
+                });
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("done".into())
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let mock: Arc<dyn Tool> = Arc::new(ReadHeavyTask {
+            calls: calls.clone(),
+        });
+        let script = r#"
+            try {
+              thclaws.subagent({ prompt: "summarize", budget: {tokens: 8000} });
+              "ok";
+            } catch (e) { "ERR:" + e.message; }
+        "#
+        .to_string();
+
+        let result: std::result::Result<String, String> = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            set_usage_sink(true);
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sb = WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sb.run(&script).map_err(|e| e.to_string())
+            })();
+            set_task_tool(None);
+            set_usage_sink(false);
+            res
+        })
+        .await
+        .unwrap();
+
+        let out = result.unwrap();
+        assert_eq!(
+            out, "ok",
+            "input-heavy worker must not exceed an output-token budget: {out}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1670,6 +2655,121 @@ paths.map((p, i) => `${p} — ${summaries[i]}`).join("\n");"#;
         assert!(
             msg.contains("after 2 attempt") && msg.contains("schema"),
             "expected schema-exhaustion error in: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_provider_error_retries_without_script_opt_in() {
+        // A flaky stream error must retry even though the script set NO
+        // `retry:` — the transient floor covers it. This is the exact
+        // failure (`stream: error decoding response body`) that killed a
+        // real WorkflowRun.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct FlakyStream {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl Tool for FlakyStream {
+            fn name(&self) -> &'static str {
+                "Task"
+            }
+            fn description(&self) -> &'static str {
+                "flaky stream mock"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, _input: Value) -> crate::Result<String> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 2 {
+                    Err(crate::Error::Provider(
+                        "stream: error decoding response body".into(),
+                    ))
+                } else {
+                    Ok("recovered".into())
+                }
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let mock: Arc<dyn Tool> = Arc::new(FlakyStream {
+            calls: calls.clone(),
+        });
+        // No `retry:` — relies on the transient floor.
+        let script = r#"thclaws.subagent({prompt: "go"})"#.to_string();
+        let result: std::result::Result<String, String> = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sb = WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sb.run(&script).map_err(|e| e.to_string())
+            })();
+            set_task_tool(None);
+            res
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), "recovered");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "transient error should have retried"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deterministic_failure_does_not_use_transient_floor() {
+        // A non-transient failure (schema mismatch) with no `retry:`
+        // (default max 1) must fail after exactly ONE attempt — the
+        // transient floor is reserved for flaky provider/stream errors.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct AlwaysBad {
+            calls: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl Tool for AlwaysBad {
+            fn name(&self) -> &'static str {
+                "Task"
+            }
+            fn description(&self) -> &'static str {
+                "always-bad mock"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn call(&self, _input: Value) -> crate::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"wrong": "shape"}"#.into())
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let mock: Arc<dyn Tool> = Arc::new(AlwaysBad {
+            calls: calls.clone(),
+        });
+        let script = r#"
+            try {
+              thclaws.subagent({prompt: "x", schema: {type: "object", required: ["ok"]}});
+              "should-not-reach";
+            } catch (e) { e.message; }
+        "#
+        .to_string();
+        let result: std::result::Result<String, String> = tokio::task::spawn_blocking(move || {
+            set_task_tool(Some(mock));
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sb = WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sb.run(&script).map_err(|e| e.to_string())
+            })();
+            set_task_tool(None);
+            res
+        })
+        .await
+        .unwrap();
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("after 1 attempt"),
+            "deterministic failure must fail fast (1 attempt): {msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "schema failure must not consume the transient floor"
         );
     }
 

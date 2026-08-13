@@ -19,7 +19,7 @@ pub(crate) struct WorkflowLogger {
 }
 
 impl WorkflowLogger {
-    /// Open `<cwd>/.thclaws/workflows/<id>/state.jsonl` for append,
+    /// Open `<cwd>/.thclaws/state/workflows/<id>/state.jsonl` for append,
     /// creating the parent directory if needed.
     pub fn new(id: String, cwd: &Path) -> std::io::Result<Self> {
         let dir = Self::dir(cwd, &id);
@@ -36,7 +36,10 @@ impl WorkflowLogger {
     }
 
     pub fn dir(cwd: &Path, id: &str) -> PathBuf {
-        cwd.join(".thclaws").join("workflows").join(id)
+        cwd.join(".thclaws")
+            .join("state")
+            .join("workflows")
+            .join(id)
     }
 
     /// Number of workers spawned during this run — read by the REPL
@@ -233,6 +236,7 @@ mod tests {
         let path = tmp
             .path()
             .join(".thclaws")
+            .join("state")
             .join("workflows")
             .join(&id)
             .join("state.jsonl");
@@ -273,6 +277,7 @@ mod tests {
         let path = tmp
             .path()
             .join(".thclaws")
+            .join("state")
             .join("workflows")
             .join(&id)
             .join("state.jsonl");
@@ -297,6 +302,7 @@ mod tests {
         let path = tmp
             .path()
             .join(".thclaws")
+            .join("state")
             .join("workflows")
             .join(&id)
             .join("state.jsonl");

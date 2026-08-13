@@ -109,6 +109,38 @@ Long form, when desktop and serve defaults should differ:
 }
 ```
 
+## The Media Studio shell  *(built-in)*
+
+thClaws ships three built-in shells — **Session Explorer**, **Chatbot**,
+and **Media Studio**. Media Studio is a point-and-click front end for the
+image & video tools (Chapter 11), so you can generate media without
+typing tool calls in chat.
+
+Open it from the GUI Shell picker (`media-studio`), or pin it:
+
+```jsonc
+// ./.thclaws/settings.json
+{ "guiShell": "media-studio" }
+```
+
+What it does:
+
+- **Mode switch** — Text → Image, Image → Image (edit), Text → Video,
+  Image → Video.
+- **Provider / model picker** with a **resolution** control for video
+  (720P / 1080P).
+- **Gallery** of everything already in `output/` (not just what you just
+  generated) — click any item to set it as the source image for an
+  Image → Image or Image → Video run; click to open it in the lightbox.
+- **Async video** is handled for you — the shell submits the job and
+  polls `MediaJobStatus` until the clip is ready, then drops it in the
+  gallery.
+
+Media Studio **auto-enables the media tools** for its own session, so you
+don't have to set `mediaToolsEnabled` first — but you still need the
+relevant provider key (`GEMINI_API_KEY` / `OPENAI_API_KEY` /
+`DASHSCOPE_API_KEY`, see Chapter 11) in your environment or keychain.
+
 ---
 
 ## Mode B — serve a shell over the cloud  *(Tier 2)*
@@ -350,27 +382,65 @@ const { runId } = await thclaws.run("Summarise this in one line.");
 // Cancel an in-flight turn (equivalent of Cmd+. in Chat)
 thclaws.cancel(runId);
 
-// Subscribe to streaming events
+// Subscribe to streaming events. on() returns an unsubscribe function.
 const unsubscribe = thclaws.on("text", (chunk) => render(chunk));
+thclaws.on("ready",       ()        => …);   // bridge ready (Mode A)
 thclaws.on("tool_call",   (call)   => …);   // Tier 2
 thclaws.on("tool_result", (result) => …);   // Tier 2
 thclaws.on("done",        ()        => …);
 thclaws.on("error",       (err)     => …);
 
-// Direct tool invocation — bypass the agent loop for deterministic actions
-// (Tier 2; manifest must declare `tools.invoke:<name>` in Tier 3).
-// `<name>` is whatever tool you've registered — typically an MCP tool
-// like `mcp__pinn_ai__text2image` (sanitised from the server name) or
-// a built-in like `Ls`. Prefer thclaws.run() + an AGENTS.md playbook
-// for most shells — it composes with whatever provider stack the
-// user has configured. See the Image Generator example shell.
-const result = await thclaws.tools.invoke("mcp__your_server__your_tool", { … });
+// Or consume a turn as an async stream (sugar over run() + on()).
+for await (const ev of thclaws.streamTurn("Summarise this.")) {
+  if (ev.type === "text") render(ev.delta);
+  else if (ev.type === "tool_call") showSpinner(ev.label);
+}
+
+// Direct tool invocation — bypass the agent loop for deterministic actions.
+// callTool() is the name to target going forward; tools.invoke() is the
+// older alias and behaves identically. `<name>` is whatever tool you've
+// registered — typically an MCP tool like `mcp__pinn_ai__text2image`
+// (sanitised from the server name) or a built-in like `Ls`. Read-only
+// tools work directly; mutating tools (Bash/Write/Edit/…) reject with
+// "requires approval". Prefer thclaws.run() + an AGENTS.md playbook for
+// most shells — it composes with whatever provider stack the user has
+// configured. See the Image Generator example shell.
+const result = await thclaws.callTool("mcp__your_server__your_tool", { … });
+
+// Turn an agent-produced file path into a URL the browser can load —
+// e.g. <img src={thclaws.fileUrl(payload.file)}>. Mode B accepts a path
+// relative to the shell's project root; Mode A needs an absolute path
+// (returns null otherwise).
+const src = thclaws.fileUrl("output/diagram.svg");
 
 // Per-shell, per-session storage
 // (Tier 2; file-backed at <shell-root>/state/<sessionId>.json)
 await thclaws.storage.set("last_query", query);
 const last = await thclaws.storage.get("last_query");
+await thclaws.storage.set("last_query", null);  // delete by writing null
+
+// Host UI integration — theme + full-screen. The bridge also mirrors the
+// host theme onto document.documentElement[data-theme] + color-scheme,
+// so most shells can theme in CSS alone and never touch these.
+thclaws.ui.theme            // "light" | "dark" (host's resolved theme)
+thclaws.ui.isFullscreen     // true while the host shows this shell full-screen
+thclaws.ui.onTheme((t)   => repaint(t));         // fires immediately + on change
+thclaws.ui.onFullscreen((active) => {            // fires immediately + on change
+  myExitButton.hidden = !active;
+  if (active) thclaws.ui.claimExitControl();     // hide host's fallback exit chip
+});
+myExitButton.onclick = () => thclaws.ui.exitFullscreen();
 ```
+
+> **The full surface is wired.** As of the Tier-3 update every bridge
+> method is backed end-to-end: `run` / `cancel` / `on` / `streamTurn`
+> (yields `text` / `tool_call` / `tool_result`) / `callTool` +
+> `tools.invoke` / `storage.get` + `set` + `delete` (10 MB per-shell cap) /
+> `approvals.subscribe` + `respond` (render your own approve/deny widget
+> instead of the system modal) / `awaitApproval` / `uploadFile` (push a
+> blob → returns a servable URL) / `permissions.list` + `has` /
+> `model.*` + `kms.*` + `research.*` / `fileUrl` / `ui.*`. Any call that
+> the host can't answer self-rejects after 15 minutes, so nothing hangs.
 
 The bridge is **the only API**. Shells cannot reach the workspace
 filesystem, the network (unless `network.outbound:<host>` is
@@ -384,10 +454,16 @@ Declare what your shell does in `manifest.json::permissions`:
 | Permission | Allows |
 |---|---|
 | `agent.run` | `thclaws.run()` and event subscription |
-| `tools.invoke:<name>` | direct `thclaws.tools.invoke("<name>", …)` per tool |
+| `tools.invoke:<name>` | direct `thclaws.callTool("<name>", …)` / `thclaws.tools.invoke(…)` per tool |
 | `session.read` / `session.list` | read sidecar session data |
 | `fs.shell-scoped` | read/write inside the shell's resolved root |
 | `network.outbound:<host>` | `fetch()` to that host (CSP injected at serve time) |
+| `approval.inline` | the shell renders its own approve/deny widget (`thclaws.approvals.*`) instead of the system modal |
+| `model.read` / `model.write` | `thclaws.model.*` — see / switch the model |
+| `kms.read` / `research.read` | `thclaws.kms.*` / `thclaws.research.*` — read the knowledge base / research jobs directly |
+
+Declaring any `tools.invoke:<name>` **restricts** the shell to just those
+tools (`tools.invoke:*` = all); declaring none leaves it unrestricted.
 
 Users see this list before installing. Anything not declared throws
 at call time.

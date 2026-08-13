@@ -105,6 +105,36 @@ Mode A เป็น default Mode B (Tier 2) ใช้สำหรับเรี
 }
 ```
 
+## Media Studio shell  *(built-in)*
+
+thClaws มี shell มาให้สามตัว — **Session Explorer**, **Chatbot** และ
+**Media Studio** โดย Media Studio เป็นหน้าจอแบบคลิก ๆ สำหรับเครื่องมือ
+สร้างภาพและวิดีโอ (บทที่ 11) ให้สร้างสื่อได้โดยไม่ต้องพิมพ์ tool call ในแชต
+
+เปิดจาก picker ของ GUI Shell (`media-studio`) หรือ pin ไว้:
+
+```jsonc
+// ./.thclaws/settings.json
+{ "guiShell": "media-studio" }
+```
+
+มันทำอะไรได้:
+
+- **สลับโหมด** — Text → Image, Image → Image (แก้ภาพ), Text → Video,
+  Image → Video
+- **เลือก provider / model** พร้อมตัวควบคุม **resolution** สำหรับวิดีโอ
+  (720P / 1080P)
+- **แกลเลอรี** ของทุกอย่างที่อยู่ใน `output/` อยู่แล้ว (ไม่ใช่แค่ที่เพิ่ง
+  สร้าง) — คลิกชิ้นไหนก็ได้เพื่อตั้งเป็นภาพต้นทางของงาน Image → Image หรือ
+  Image → Video หรือคลิกเพื่อเปิดดูใน lightbox
+- **วิดีโอ async** จัดการให้อัตโนมัติ — shell จะ submit งานแล้ว poll
+  `MediaJobStatus` จนคลิปเสร็จ แล้วหย่อนลงแกลเลอรี
+
+Media Studio **เปิด media tools ให้อัตโนมัติ** สำหรับ session ของมันเอง
+จึงไม่ต้องตั้ง `mediaToolsEnabled` ก่อน — แต่ยังต้องมี key ของ provider
+ที่เกี่ยวข้อง (`GEMINI_API_KEY` / `OPENAI_API_KEY` / `DASHSCOPE_API_KEY`
+ดูบทที่ 11) ใน environment หรือ keychain
+
 ---
 
 ## Mode B — serve shell ขึ้น cloud  *(Tier 2)*
@@ -343,26 +373,63 @@ const { runId } = await thclaws.run("Summarise this in one line.");
 // ยกเลิก turn ที่กำลังรัน (เทียบเท่า Cmd+. ใน Chat)
 thclaws.cancel(runId);
 
-// Subscribe event streaming
+// Subscribe event streaming — on() คืน function สำหรับ unsubscribe
 const unsubscribe = thclaws.on("text", (chunk) => render(chunk));
+thclaws.on("ready",       ()        => …);   // bridge พร้อม (Mode A)
 thclaws.on("tool_call",   (call)   => …);   // Tier 2
 thclaws.on("tool_result", (result) => …);   // Tier 2
 thclaws.on("done",        ()        => …);
 thclaws.on("error",       (err)     => …);
 
+// หรือ consume turn เป็น async stream (น้ำตาลเคลือบ run() + on())
+for await (const ev of thclaws.streamTurn("Summarise this.")) {
+  if (ev.type === "text") render(ev.delta);
+  else if (ev.type === "tool_call") showSpinner(ev.label);
+}
+
 // เรียก tool ตรง ๆ — bypass agent loop สำหรับ action ที่ deterministic
-// (Tier 2; manifest ต้องประกาศ `tools.invoke:<name>` ใน Tier 3)
-// `<name>` คือ tool ที่ register แล้ว — ส่วนใหญ่จะเป็น MCP tool
-// เช่น `mcp__pinn_ai__text2image` (sanitised จาก server name) หรือ
-// built-in เช่น `Ls` ส่วนใหญ่แนะนำให้ใช้ thclaws.run() + AGENTS.md
-// แทน — ใช้ provider stack ของ user ได้ทันที
-const result = await thclaws.tools.invoke("mcp__your_server__your_tool", { … });
+// callTool() คือชื่อที่ควรใช้ต่อไป; tools.invoke() เป็น alias เก่า
+// พฤติกรรมเหมือนกัน `<name>` คือ tool ที่ register แล้ว — ส่วนใหญ่
+// เป็น MCP tool เช่น `mcp__pinn_ai__text2image` (sanitised จาก
+// server name) หรือ built-in เช่น `Ls` tool แบบอ่านอย่างเดียวเรียก
+// ได้ตรง ๆ; tool ที่แก้ไข (Bash/Write/Edit/…) จะ reject ด้วย
+// "requires approval" ส่วนใหญ่แนะนำให้ใช้ thclaws.run() + AGENTS.md
+const result = await thclaws.callTool("mcp__your_server__your_tool", { … });
+
+// แปลง path ของไฟล์ที่ agent สร้างให้เป็น URL ที่ browser โหลดได้ —
+// เช่น <img src={thclaws.fileUrl(payload.file)}> Mode B รับ path
+// relative กับ project root ของ shell; Mode A ต้องเป็น absolute path
+// (ไม่งั้นคืน null)
+const src = thclaws.fileUrl("output/diagram.svg");
 
 // Storage ของ shell แยกตาม session
 // (Tier 2; เก็บเป็นไฟล์ที่ <shell-root>/state/<sessionId>.json)
 await thclaws.storage.set("last_query", query);
 const last = await thclaws.storage.get("last_query");
+await thclaws.storage.delete("last_query");  // ลบ key ออกจริง
+
+// เชื่อมกับ UI ของ host — theme + full-screen bridge mirror theme
+// ของ host ไปที่ document.documentElement[data-theme] + color-scheme
+// ให้แล้ว shell ส่วนใหญ่จึง theme ด้วย CSS ล้วน ไม่ต้องแตะตรงนี้
+thclaws.ui.theme            // "light" | "dark" (theme ที่ host resolve)
+thclaws.ui.isFullscreen     // true เมื่อ host แสดง shell แบบ full-screen
+thclaws.ui.onTheme((t)   => repaint(t));         // ยิงทันที + เมื่อเปลี่ยน
+thclaws.ui.onFullscreen((active) => {            // ยิงทันที + เมื่อเปลี่ยน
+  myExitButton.hidden = !active;
+  if (active) thclaws.ui.claimExitControl();     // ซ่อนปุ่ม exit fallback ของ host
+});
+myExitButton.onclick = () => thclaws.ui.exitFullscreen();
 ```
+
+> **ทั้ง surface wire ครบแล้ว** ตั้งแต่ Tier 3 ทุก method ของ bridge
+> backed ครบทั้งเส้น: `run` / `cancel` / `on` / `streamTurn` (คืน
+> `text` / `tool_call` / `tool_result`) / `callTool` + `tools.invoke` /
+> `storage.get` + `set` + `delete` (เพดาน 10 MB ต่อ shell) /
+> `approvals.subscribe` + `respond` (แสดง widget approve/deny ของ shell
+> เองแทน system modal) / `awaitApproval` / `uploadFile` (ดันไฟล์ → คืน URL
+> ที่ serve ได้) / `permissions.list` + `has` / `model.*` + `kms.*` +
+> `research.*` / `fileUrl` / `ui.*` ทุกคำขอที่ host ตอบไม่ได้จะ
+> self-reject หลัง 15 นาที จึงไม่มี hang
 
 Bridge คือ **API ทั้งหมด** Shell แตะ filesystem ของ workspace
 ไม่ได้ แตะ network ไม่ได้ (ถ้าไม่ประกาศ `network.outbound:<host>`
@@ -376,10 +443,16 @@ Bridge คือ **API ทั้งหมด** Shell แตะ filesystem ขอ
 | Permission | อนุญาตให้ |
 |---|---|
 | `agent.run` | เรียก `thclaws.run()` และ subscribe event |
-| `tools.invoke:<name>` | เรียก `thclaws.tools.invoke("<name>", …)` ตรง ๆ ทีละ tool |
+| `tools.invoke:<name>` | เรียก `thclaws.callTool("<name>", …)` / `thclaws.tools.invoke(…)` ตรง ๆ ทีละ tool |
 | `session.read` / `session.list` | อ่านข้อมูล session sidecar |
 | `fs.shell-scoped` | read/write ภายใน root ของ shell ตัวเอง |
 | `network.outbound:<host>` | `fetch()` ไปยัง host นั้น (CSP inject ตอน serve) |
+| `approval.inline` | shell แสดง widget approve/deny ของตัวเอง (`thclaws.approvals.*`) แทน system modal |
+| `model.read` / `model.write` | `thclaws.model.*` — ดู / สลับ model |
+| `kms.read` / `research.read` | `thclaws.kms.*` / `thclaws.research.*` — อ่าน knowledge base / research job ตรง ๆ |
+
+การประกาศ `tools.invoke:<name>` ตัวใดตัวหนึ่งจะ **จำกัด** ให้ shell เรียกได้
+เฉพาะ tool ที่ประกาศ (`tools.invoke:*` = ทุกตัว); ถ้าไม่ประกาศเลยจะเรียกได้ไม่จำกัด
 
 User จะเห็น list นี้ก่อนติดตั้ง อะไรที่ไม่ประกาศจะ throw ตอน call
 

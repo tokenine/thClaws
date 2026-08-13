@@ -33,19 +33,23 @@ use crate::providers::provider_has_credentials;
 use crate::session::SessionStore;
 use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
 use crate::uploads::{
-    ensure_uploads_dir, render_upload_message, unique_path, UploadedFile, UPLOADS_DIRNAME,
-    UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES,
+    ensure_target_dir, ensure_uploads_dir, render_upload_message, unique_path, UploadedFile,
+    UPLOADS_DIRNAME, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES,
 };
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Multipart, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 /// The same single-file React build the desktop GUI embeds. Re-embedded
@@ -87,6 +91,18 @@ pub struct MultiTenantMode {
     pub max_users: usize,
     /// Idle-TTL for session eviction.
     pub idle_timeout: std::time::Duration,
+    /// dev-plan/42: when `Some`, each user gets their own working
+    /// directory `<workspaces_base>/workspace-<user_id>/` (the "a
+    /// workspace per user" model). `None` keeps the dev-plan/35 layout
+    /// (one shared cwd + per-user state subtrees).
+    pub workspaces_base: Option<std::path::PathBuf>,
+    /// dev-plan/42: read-only agent-def source seeded into each new
+    /// per-user workspace (frozen snapshot). `None` → empty workspaces.
+    pub def_source: Option<std::path::PathBuf>,
+    /// dev-plan/42 Phase 5: the workspace owner's user id — their seeded
+    /// def is writable (they author + publish); everyone else's is
+    /// read-only. `None` → all read-only.
+    pub owner_user_id: Option<String>,
 }
 
 impl std::fmt::Debug for MultiTenantMode {
@@ -96,6 +112,9 @@ impl std::fmt::Debug for MultiTenantMode {
             .field("hmac_secret", &"<redacted>")
             .field("max_users", &self.max_users)
             .field("idle_timeout", &self.idle_timeout)
+            .field("workspaces_base", &self.workspaces_base)
+            .field("def_source", &self.def_source)
+            .field("owner_user_id", &self.owner_user_id)
             .finish()
     }
 }
@@ -159,6 +178,20 @@ struct ServeState {
     /// session from this registry instead of using `shared`.
     /// `None` = single-tenant (use `shared`).
     multi_tenant: Option<MultiTenantState>,
+    /// Count of active browser WS connections. Incremented on
+    /// `handle_socket` entry, decremented on exit (via `WsGuard`).
+    /// Read by the optional `cloud_heartbeat` task to decide whether
+    /// to ping `last_active_at` on the thclaws.cloud control plane —
+    /// see `spawn_cloud_heartbeat` for the full path. Zero connections
+    /// means "no browser tab is currently watching this engine"; the
+    /// cloud reaper is then free to pause the workspace after its
+    /// idle-timeout window.
+    ws_connections: Arc<AtomicUsize>,
+    /// One-line notice surfaced to each connecting client when the
+    /// configured permission mode had to be overridden (e.g. a multiuser
+    /// pod where "ask" can't be routed per-user, so it falls back to
+    /// auto-approve). `None` when nothing was overridden.
+    permission_notice: Option<String>,
 }
 
 /// State derived from [`MultiTenantMode`] at server bootstrap. Held
@@ -167,12 +200,29 @@ struct ServeState {
 #[derive(Clone)]
 struct MultiTenantState {
     registry: crate::multi_tenant::UserSessionRegistry,
-    hmac_secret: Arc<Vec<u8>>,
+    verifier: Arc<crate::multi_tenant::IdentityVerifier>,
 }
 
 /// Spin up the server. Spawns the worker, builds the Axum router,
 /// blocks until the listener returns (Ctrl-C / panic / shutdown).
 pub async fn run(config: ServeConfig) -> crate::error::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&config.bind)
+        .await
+        .map_err(|e| crate::error::Error::Tool(format!("bind {}: {e}", config.bind)))?;
+    run_on(config, listener).await
+}
+
+/// Serve on a listener the caller already bound.
+///
+/// Exists so a caller can own the bind. Asking the OS for port 0, dropping the
+/// listener, and letting `run` re-bind leaves a window where anything on the
+/// machine can take that port — which is exactly what made the round-trip test
+/// fail at random under a parallel suite. Holding the listener from allocation
+/// through to serving closes it.
+pub async fn run_on(
+    config: ServeConfig,
+    listener: tokio::net::TcpListener,
+) -> crate::error::Result<()> {
     // M6.36 SERVE6 hint: keychain access doesn't make sense on a
     // headless server (no user session, often no Secret Service
     // running). Skip the keychain probe by default; users put API
@@ -232,7 +282,7 @@ pub async fn run(config: ServeConfig) -> crate::error::Result<()> {
         }
     }
 
-    let (approver, _approval_rx) = crate::permissions::GuiApprover::new();
+    let (approver, mut approval_rx) = crate::permissions::GuiApprover::new();
     let shared = Arc::new(crate::shared_session::spawn_with_approver(approver.clone()));
     // The frontend's "I'm ready" handshake unblocks deferred startup
     // (MCP spawn, etc.). Without a UI to wait on, signal immediately
@@ -282,7 +332,42 @@ pub async fn run(config: ServeConfig) -> crate::error::Result<()> {
         });
     }
 
-    run_with_engine(config, approver, shared, pending_asks, ask_broadcast).await
+    // Approval bridge — the fix for the serve hang. Pre-fix this rx was
+    // dropped (`_approval_rx`), so when a tool required approval (any time
+    // the permission mode is Ask) `GuiApprover::approve()` sent the request
+    // into an unserviced channel and blocked on its oneshot FOREVER: a hung
+    // turn with no file written. We now drain the channel and broadcast each
+    // `approval_request` to every WS client; the frontend renders the modal
+    // and the decision returns via `handle_ipc`'s `approval_response` arm,
+    // which calls `approver.resolve(id, decision)`. Mirrors the AskUser
+    // bridge above (the responder oneshots live inside the GuiApprover, so
+    // no `pending_asks` bookkeeping is needed here).
+    {
+        let approval_broadcast = ask_broadcast.clone();
+        tokio::spawn(async move {
+            while let Some(req) = approval_rx.recv().await {
+                let payload = serde_json::json!({
+                    "type": "approval_request",
+                    "id": req.id,
+                    "tool_name": req.tool_name,
+                    "input": req.input,
+                    "summary": req.summary,
+                    "originator": req.originator,
+                });
+                let _ = approval_broadcast.send(payload.to_string());
+            }
+        });
+    }
+
+    run_with_engine(
+        config,
+        approver,
+        shared,
+        pending_asks,
+        ask_broadcast,
+        Some(listener),
+    )
+    .await
 }
 
 /// Same as [`run`], but reuses an engine constructed by the caller. Used
@@ -295,12 +380,49 @@ pub async fn run_with_engine(
     shared: Arc<SharedSessionHandle>,
     pending_asks: PendingAsks,
     ask_broadcast: broadcast::Sender<String>,
+    // Pre-bound listener, or `None` to bind `config.bind` here. See
+    // `run_on` for why a caller might want to own the bind.
+    listener: Option<tokio::net::TcpListener>,
 ) -> crate::error::Result<()> {
     let workspace = match config.workspace.clone() {
         Some(p) => p,
         None => std::env::current_dir()
             .map_err(|e| crate::error::Error::Tool(format!("workspace cwd unavailable: {e}")))?,
     };
+    // dev-plan/42: flag the process as multiuser so global cwd/sandbox
+    // mutators (IPC `set_cwd`) stay no-ops — per-session roots come from
+    // the task-local working dir, not process-global state.
+    let mut permission_notice: Option<String> = None;
+    if config.multi_tenant.is_some() {
+        crate::workdir::set_multiuser(true);
+        // MULTIUSER approval safety net. One shared worker processes every
+        // user's turns and ShellInput carries no user_id, so an approval
+        // request can't be routed to the user who triggered it: broadcasting
+        // it pod-wide would leak one user's prompt to another, and blocking
+        // would hang. Auto-approve instead — multiuser isolates each user in
+        // their own `workspace-<user_id>/` folder, so an auto-approved tool
+        // is bounded to that user's own sandbox. `spawn_with_approver` set
+        // the mode from config.permissions; override it to Auto here.
+        let was_ask = crate::permissions::current_mode() == crate::permissions::PermissionMode::Ask;
+        crate::permissions::set_current_mode(crate::permissions::PermissionMode::Auto);
+        if was_ask {
+            // The pod was configured for "ask" — surface why it isn't honored
+            // (rare, but shouldn't be silent).
+            permission_notice = Some(
+                "“ask” permission mode isn't supported in shared (multiuser) workspaces — \
+                 tool approvals can't be routed to an individual user, so thClaws uses \
+                 auto-approve here. Your files stay isolated to your own workspace folder."
+                    .to_string(),
+            );
+            eprintln!(
+                "\x1b[33m[serve] multiuser: configured 'ask' overridden to auto-approve (not per-user routable)\x1b[0m"
+            );
+        } else {
+            eprintln!(
+                "\x1b[36m[serve] multiuser: auto-approve (folder-isolated; approvals aren't per-user routable)\x1b[0m"
+            );
+        }
+    }
     // dev-plan/35 Tier 1: construct the multi-tenant registry +
     // background evictor when multi-tenant mode is configured.
     let multi_tenant_state = config.multi_tenant.as_ref().map(|cfg| {
@@ -313,6 +435,10 @@ pub async fn run_with_engine(
                 // <workspace>/.thclaws/users/<user_id>/... so a pod
                 // restart preserves every user's session.
                 project_root: workspace.clone(),
+                // dev-plan/42: per-user working dirs + def seed source.
+                workspaces_base: cfg.workspaces_base.clone(),
+                def_source: cfg.def_source.clone(),
+                owner_user_id: cfg.owner_user_id.clone(),
             });
         // Sweep every 30s — fine for 30m default idle_timeout, will
         // need re-tuning if Tier 3 wants sub-minute sessions.
@@ -321,11 +447,22 @@ pub async fn run_with_engine(
             "\x1b[36m[serve] multi-tenant on — max_users={}, idle_timeout={:?}\x1b[0m",
             cfg.max_users, cfg.idle_timeout
         );
+        // dev-plan/45 B: prefer the asymmetric verifier when the pod is
+        // provisioned with THCLAWS_CLOUD_PUBKEY; a malformed pubkey is a
+        // hard startup error (never silently downgrade to the forgeable
+        // symmetric proof).
+        let verifier = crate::multi_tenant::IdentityVerifier::from_secret_and_pubkey(
+            &cfg.hmac_secret,
+            std::env::var("THCLAWS_CLOUD_PUBKEY").ok().as_deref(),
+        )
+        .expect("THCLAWS_CLOUD_PUBKEY is set but not a valid 32-byte hex Ed25519 key");
         MultiTenantState {
             registry,
-            hmac_secret: Arc::new(cfg.hmac_secret.clone()),
+            verifier: Arc::new(verifier),
         }
     });
+    let ws_connections = Arc::new(AtomicUsize::new(0));
+    let _ = SERVE_WORKSPACE.set(workspace.clone()); // for /healthz background-job probe
     let state = ServeState {
         shared,
         approver,
@@ -333,7 +470,20 @@ pub async fn run_with_engine(
         ask_broadcast,
         workspace: Arc::new(workspace),
         multi_tenant: multi_tenant_state,
+        ws_connections: ws_connections.clone(),
+        permission_notice,
     };
+    // Grab the identity verifier BEFORE `state` moves into the router —
+    // the multiuser auth layer below needs it.
+    let mt_verifier = state.multi_tenant.as_ref().map(|m| m.verifier.clone());
+
+    // Cloud heartbeat: when running inside a thclaws.cloud workspace
+    // pod, periodically POST to `/api/hosted/workspaces/<id>/keepalive`
+    // while at least one browser tab is connected. The provisioner
+    // injects THCLAWS_CLOUD_URL / THCLAWS_CLOUD_TOKEN / THCLAWS_WORKSPACE_ID
+    // at provision time. Outside cloud (any env var missing), this is
+    // a no-op — local CLI / desktop GUI runs don't need it.
+    spawn_cloud_heartbeat(ws_connections);
 
     // Loopback-only safety check for the API auth-bypass token. The
     // bypass mode (`THCLAWS_API_TOKEN=disable-auth`) makes the OpenAI
@@ -355,18 +505,84 @@ pub async fn run_with_engine(
     let app = if let Some(mode) = config.gui_shell.clone() {
         build_shell_router(&config.bind, state, mode)?
     } else {
+        // Mode C (cloud serve / browser SSH-tunnel): the React webapp
+        // hosts gui-shells in iframes. Browser has no `thclaws://`
+        // protocol handler, so expose the shell folders over HTTP
+        // under `/gui-shell/<id>/...`. The bridge runs in postMessage
+        // mode (inline-injected) — no per-shell WS.
         Router::new()
             .route("/", get(serve_index))
             .route("/healthz", get(serve_health))
             .route("/ws", get(ws_handler))
             .route("/upload", post(serve_upload))
+            .route("/gui-shell/{shell_id}", get(serve_gui_shell_index))
+            .route("/gui-shell/{shell_id}/", get(serve_gui_shell_index))
+            .route(
+                "/gui-shell/{shell_id}/index.html",
+                get(serve_gui_shell_index),
+            )
+            .route("/gui-shell/{shell_id}/{*rest}", get(serve_gui_shell_asset))
+            // Workspace file passthrough — GUI shells can render
+            // agent-produced files (image-batch's images/<slug>/*.png,
+            // generated PDFs, contact-sheet HTML) via direct
+            // <img src="/file-asset/images/foo/bar.png"> tags. The
+            // server-side check is `Sandbox::check_in(cwd, rel)` so
+            // paths can't escape the workspace. Single-tenant per
+            // pod, so no cross-user concern (multi-tenant adds the
+            // HMAC layer in build_shell_router).
+            .route("/file-asset/{*rel}", get(serve_file_asset))
+            // Workspace sync (dev-plan/51): /cloud push|pull against the
+            // workspace dir. Same auth surface as /upload — the cloud ingress
+            // ForwardAuth gates hosted runners (and the multiuser_auth layer
+            // below covers multiuser pods); local --serve relies on
+            // api_v1/loopback. push raises the body limit for the tarball.
+            // job-artifacts Tier 1: `THCLAWS_SYNC_REQUIRE_AUTH=1` opts the
+            // whole sync group into the SAME Bearer policy as /v1 (the
+            // route_layer below), so an external orchestrator can use
+            // export/push holding only THCLAWS_API_TOKEN — no tunnel /
+            // ForwardAuth. Unset = classic trusted-network behavior,
+            // existing deployments unaffected.
+            .merge(
+                axum::Router::new()
+                    .route("/workspace/sync/stat", get(sync_stat))
+                    .route("/workspace/sync/pull", get(sync_pull))
+                    .route(
+                        "/workspace/sync/push",
+                        post(sync_push).layer(DefaultBodyLimit::max(
+                            crate::cloud::wssync::MAX_SYNC_BYTES as usize,
+                        )),
+                    )
+                    // P2 incremental: manifest diff + per-subset transfer/trash.
+                    .route("/workspace/sync/manifest", get(sync_manifest))
+                    .route(
+                        "/workspace/sync/export",
+                        post(sync_export).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+                    )
+                    .route(
+                        "/workspace/sync/trash",
+                        post(sync_trash).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+                    )
+                    // Agreed sync revision, recorded after a sync lands (both
+                    // directions) so the two ends name the same number.
+                    .route("/workspace/sync/revision", post(sync_revision))
+                    .route_layer(axum::middleware::from_fn(sync_bearer_gate)),
+            )
             .with_state(state)
             .merge(crate::api_v1::router())
     };
 
-    let listener = tokio::net::TcpListener::bind(&config.bind)
-        .await
-        .map_err(|e| crate::error::Error::Tool(format!("bind {}: {e}", config.bind)))?;
+    // dev-plan/42: gate the ENTIRE surface behind HMAC identity in a
+    // multiuser pod (both router shapes above), so no route is reachable
+    // without a verified user. /healthz stays open for k8s probes.
+    let app = if let Some(verifier) = mt_verifier {
+        app.layer(axum::middleware::from_fn_with_state(
+            verifier,
+            multiuser_auth,
+        ))
+    } else {
+        app
+    };
+
     if config.gui_shell.is_none() {
         eprintln!(
             "\x1b[36m[serve] thClaws listening on http://{}\x1b[0m",
@@ -374,10 +590,282 @@ pub async fn run_with_engine(
         );
         eprintln!("\x1b[36m[serve] open the URL above in your browser (over an SSH tunnel for remote access)\x1b[0m");
     }
+    let listener = match listener {
+        Some(l) => l,
+        None => tokio::net::TcpListener::bind(&config.bind)
+            .await
+            .map_err(|e| crate::error::Error::Tool(format!("bind {}: {e}", config.bind)))?,
+    };
     axum::serve(listener, app)
         .await
         .map_err(|e| crate::error::Error::Tool(format!("serve: {e}")))?;
     Ok(())
+}
+
+// ---- Workspace sync handlers (dev-plan/51) ----
+// Tar/untar the workspace dir for `/cloud push|pull`. Reachable wherever the
+// engine serves; auth is the serving layer's job (cloud ingress ForwardAuth for
+// hosted runners — single- or multi-tenant — and api_v1/loopback for a local
+// `--serve`), same as the adjacent /upload route.
+
+#[derive(serde::Serialize)]
+struct SyncStatResp {
+    file_count: usize,
+    bytes: u64,
+    empty: bool,
+    busy: bool,
+    engine_version: &'static str,
+    workspace_id: Option<String>,
+    /// Last sync revision this runner agreed to (see `sync_revision`).
+    revision: Option<u64>,
+}
+
+async fn sync_stat(State(state): State<ServeState>) -> Response {
+    let root = state.workspace.as_path();
+    match crate::cloud::wssync::stat_workspace(root) {
+        Ok(s) => {
+            let binding = crate::cloud::wssync::read_binding(root);
+            Json(SyncStatResp {
+                file_count: s.file_count,
+                bytes: s.bytes,
+                empty: crate::cloud::wssync::is_empty(root).unwrap_or(false),
+                busy: crate::agent_activity::busy_count() > 0,
+                engine_version: env!("CARGO_PKG_VERSION"),
+                workspace_id: binding.workspace_id,
+                revision: binding.revision,
+            })
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PullQuery {
+    #[serde(default)]
+    include_runtime: bool,
+}
+
+/// Streams a temp file as an `application/gzip` body, deleting it once the
+/// response finishes sending (the `TempPath` rides along and drops with the
+/// stream).
+struct TempFileStream {
+    inner: tokio_util::io::ReaderStream<tokio::fs::File>,
+    _path: tempfile::TempPath,
+}
+
+impl futures::Stream for TempFileStream {
+    type Item = std::io::Result<Bytes>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+async fn stream_tar_temp(tmp: tempfile::NamedTempFile) -> Response {
+    let path = tmp.into_temp_path();
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("open temp: {e}")).into_response()
+        }
+    };
+    let stream = TempFileStream {
+        inner: tokio_util::io::ReaderStream::new(file),
+        _path: path,
+    };
+    (
+        [(header::CONTENT_TYPE, "application/gzip")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn sync_pull(State(state): State<ServeState>, Query(q): Query<PullQuery>) -> Response {
+    if crate::agent_activity::busy_count() > 0 {
+        return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
+    }
+    let root = state.workspace.as_path().to_path_buf();
+    let include_runtime = q.include_runtime;
+    let tmp = tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("temp: {e}"))?;
+        crate::cloud::wssync::tar_workspace_to(&root, include_runtime, tmp.as_file())?;
+        Ok::<_, String>(tmp)
+    })
+    .await;
+    match tmp {
+        Ok(Ok(tmp)) => stream_tar_temp(tmp).await,
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PushQuery {
+    #[serde(default)]
+    delete: bool,
+    workspace_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct PushResp {
+    written: usize,
+    deleted: usize,
+    trashed: bool,
+}
+
+async fn sync_push(
+    State(state): State<ServeState>,
+    Query(q): Query<PushQuery>,
+    body: Body,
+) -> Response {
+    if crate::agent_activity::busy_count() > 0 {
+        return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
+    }
+    // Stream the upload to a temp file so a large tarball never rides in memory.
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("temp: {e}")).into_response(),
+    };
+    let write_handle = match tmp.reopen() {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("temp: {e}")).into_response(),
+    };
+    let mut afile = tokio::fs::File::from_std(write_handle);
+    let mut stream = body.into_data_stream();
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("body: {e}")).into_response(),
+        };
+        if let Err(e) = afile.write_all(&chunk).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write temp: {e}"),
+            )
+                .into_response();
+        }
+    }
+    if let Err(e) = afile.flush().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("flush temp: {e}"),
+        )
+            .into_response();
+    }
+    drop(afile);
+
+    let root = state.workspace.as_path().to_path_buf();
+    let delete = q.delete;
+    let path = tmp.into_temp_path();
+    let res = tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(&path).map_err(|e| format!("open temp: {e}"))?;
+        crate::cloud::wssync::untar_workspace_from(f, &root, delete)
+    })
+    .await;
+    match res {
+        Ok(Ok(r)) => {
+            let root = state.workspace.as_path();
+            let mut b = crate::cloud::wssync::read_binding(root);
+            if let Some(id) = q.workspace_id {
+                b.workspace_id = Some(id);
+            }
+            b.last_push = Some(unix_now_string());
+            let _ = crate::cloud::wssync::write_binding(root, &b);
+            Json(PushResp {
+                written: r.written,
+                deleted: r.deleted,
+                trashed: r.trash_dir.is_some(),
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RevisionReq {
+    revision: u64,
+    workspace_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct RevisionResp {
+    revision: u64,
+}
+
+/// Record the revision the client just completed. Monotonic on purpose: a
+/// late or replayed call can only raise the counter, never walk it back to a
+/// number a user has already seen quoted.
+async fn sync_revision(State(state): State<ServeState>, Json(req): Json<RevisionReq>) -> Response {
+    let root = state.workspace.as_path();
+    let mut b = crate::cloud::wssync::read_binding(root);
+    let revision = req.revision.max(b.revision.unwrap_or(0));
+    b.revision = Some(revision);
+    if let Some(id) = req.workspace_id {
+        b.workspace_id = Some(id);
+    }
+    match crate::cloud::wssync::write_binding(root, &b) {
+        Ok(()) => Json(RevisionResp { revision }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+fn unix_now_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+// P2 incremental endpoints.
+
+async fn sync_manifest(State(state): State<ServeState>) -> Response {
+    if crate::agent_activity::busy_count() > 0 {
+        return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
+    }
+    match crate::cloud::wssync::build_manifest(state.workspace.as_path()) {
+        Ok(m) => Json(m).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn sync_export(State(state): State<ServeState>, Json(paths): Json<Vec<String>>) -> Response {
+    if crate::agent_activity::busy_count() > 0 {
+        return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
+    }
+    let root = state.workspace.as_path().to_path_buf();
+    let tmp = tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("temp: {e}"))?;
+        crate::cloud::wssync::tar_paths_to(&root, &paths, tmp.as_file())?;
+        Ok::<_, String>(tmp)
+    })
+    .await;
+    match tmp {
+        Ok(Ok(tmp)) => stream_tar_temp(tmp).await,
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+async fn sync_trash(State(state): State<ServeState>, Json(paths): Json<Vec<String>>) -> Response {
+    if crate::agent_activity::busy_count() > 0 {
+        return (StatusCode::CONFLICT, "workspace busy (active turn)").into_response();
+    }
+    match crate::cloud::wssync::trash_paths(state.workspace.as_path(), &paths) {
+        Ok(r) => Json(PushResp {
+            written: r.written,
+            deleted: r.deleted,
+            trashed: r.trash_dir.is_some(),
+        })
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 /// Build the Mode B Axum router. Mounts the bound shell at
@@ -477,7 +965,14 @@ fn build_shell_router(
                                     .expect("build file-asset 4xx");
                             }
                         }
-                        crate::gui_shell::serve::serve_project_asset(workspace.as_ref(), &rel)
+                        let range = headers
+                            .get(axum::http::header::RANGE)
+                            .and_then(|v| v.to_str().ok());
+                        crate::gui_shell::serve::serve_project_asset(
+                            workspace.as_ref(),
+                            &rel,
+                            range,
+                        )
                     }
                 },
             ),
@@ -492,8 +987,22 @@ fn build_shell_router(
             ),
         )
         .route(&ws_url_path, get(ws_handler))
-        .route("/healthz", get(serve_health))
-        .with_state(state);
+        .route("/healthz", get(serve_health));
+
+    // dev-plan/39 Tier 1: keep classic chat reachable at /chat/ when a
+    // shell is bound at /. Only safe under no_auth — auth-gated shells
+    // would otherwise let users bypass the token by hitting /chat/. For
+    // hosted workspaces (the primary Tier 1 target) no_auth is always
+    // true because the workspace URL is auth-gated upstream by Caddy.
+    if mode.no_auth {
+        router = router
+            .route("/chat/", get(serve_index))
+            .route("/chat", get(serve_index))
+            .route("/chat/ws", get(ws_handler))
+            .route("/chat/upload", post(serve_upload));
+    }
+
+    let mut router = router.with_state(state);
 
     // /v1/* OpenAI-compat surface stays available regardless of Mode B —
     // it has its own auth (THCLAWS_API_TOKEN) independent of the shell
@@ -519,8 +1028,179 @@ fn build_shell_router(
     Ok(router)
 }
 
+/// dev-plan/42: in `--multiuser`, EVERY HTTP request must carry a valid
+/// HMAC-signed identity (the cloud routing layer injects
+/// `X-Thclaws-User` / `-ts` / `-proof`) — otherwise 401. Without this a
+/// multiuser pod would serve the index, bridge, `/upload`, and `/v1/*`
+/// to anyone, since those routes have no per-route HMAC check (only WS +
+/// file-asset did). Single-tenant `--serve` never installs this layer
+/// (keeps its `THCLAWS_API_TOKEN` Bearer model). `/healthz` is exempt so
+/// k8s liveness/readiness probes — which carry no identity — still pass.
+async fn multiuser_auth(
+    State(verifier): State<Arc<crate::multi_tenant::IdentityVerifier>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if multiuser_request_authed(req.uri().path(), req.headers(), &verifier, now) {
+        next.run(req).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+/// The auth decision for [`multiuser_auth`], split out so it's unit
+/// testable without driving a live router. `/healthz` is exempt (k8s
+/// probes); everything else needs a valid HMAC identity triple.
+fn multiuser_request_authed(
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    verifier: &crate::multi_tenant::IdentityVerifier,
+    now_secs: u64,
+) -> bool {
+    if path == "/healthz" {
+        return true;
+    }
+    let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    match (
+        get("x-thclaws-user"),
+        get("x-thclaws-user-ts"),
+        get("x-thclaws-user-proof"),
+    ) {
+        (Some(u), Some(ts), Some(p)) => crate::multi_tenant::verify_identity(
+            u,
+            ts,
+            p,
+            get("x-thclaws-user-sig"),
+            verifier,
+            now_secs,
+        )
+        .is_ok(),
+        _ => false,
+    }
+}
+
 fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
+}
+
+/// RAII guard that increments the WS-connection counter on
+/// construction and decrements on drop. Used inside `handle_socket`
+/// so the counter is panic-safe — any early return / unwind still
+/// releases the count, which the cloud heartbeat task observes on its
+/// next tick.
+struct WsGuard(Arc<AtomicUsize>);
+
+impl WsGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for WsGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Spawn a background task that pings the thclaws.cloud control plane
+/// every 60s while either (a) at least one WS connection is active OR
+/// (b) the engine has an in-flight agent turn. Used as the activity
+/// signal for the cloud's idle reaper: a workspace pod that nobody is
+/// watching AND has no work to do stops pinging, `last_active_at`
+/// ages out, the reaper scales the pod to 0.
+///
+/// Pre-fix this only checked WS connections, so closing the browser
+/// during a long batch (50-subject image gen takes ~7 min — past the
+/// 30-min reaper window if the user steps away) eventually killed
+/// the pod mid-loop. The "busy" half of the condition keeps the pod
+/// alive while there's actual work in flight, regardless of who's
+/// watching.
+///
+/// Requires three env vars from the provisioner:
+///   - `THCLAWS_CLOUD_URL`     — e.g. `https://thclaws.cloud`
+///   - `THCLAWS_CLOUD_TOKEN`   — CliToken minted at provision time
+///   - `THCLAWS_WORKSPACE_ID`  — UUID of this workspace
+///
+/// Any missing var = local / non-cloud run; the task no-ops and
+/// returns immediately so we don't burn a tokio worker on idle.
+fn spawn_cloud_heartbeat(connections: Arc<AtomicUsize>) {
+    let url = match std::env::var("THCLAWS_CLOUD_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return,
+    };
+    let token = match std::env::var("THCLAWS_CLOUD_TOKEN") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return,
+    };
+    let workspace_id = match std::env::var("THCLAWS_WORKSPACE_ID") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return,
+    };
+    let endpoint = format!(
+        "{}/api/hosted/workspaces/{}/keepalive",
+        url.trim_end_matches('/'),
+        workspace_id
+    );
+    eprintln!(
+        "\x1b[36m[serve] cloud heartbeat → {endpoint} (every 60s while WS connected or agent busy)\x1b[0m"
+    );
+    tokio::spawn(async move {
+        // Re-using the global stream client would pull in stream
+        // timeout knobs we don't want; build a small dedicated one.
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[serve] heartbeat client build failed: {e}");
+                return;
+            }
+        };
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Race the 60s tick against busy-transition notifies so the
+        // dashboard "running" pill (dev-plan/36) appears within
+        // seconds of a turn starting instead of waiting up to a
+        // minute for the next periodic ping.
+        let transition = crate::agent_activity::busy_transition();
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = transition.notified() => {}
+            }
+            let connected = connections.load(Ordering::SeqCst) > 0;
+            let busy = crate::agent_activity::is_agent_busy();
+            if !connected && !busy {
+                continue;
+            }
+            // Body carries the current busy state so the cloud
+            // dashboard can render a "running" pill on this
+            // workspace's row in the user's workspace list. The
+            // API tolerates an empty body for backwards-compat with
+            // older engines (busy field is optional server-side).
+            match client
+                .post(&endpoint)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "busy": busy }))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => {
+                    eprintln!("[serve] heartbeat {endpoint} returned HTTP {}", r.status());
+                }
+                Err(e) => {
+                    eprintln!("[serve] heartbeat {endpoint} failed: {e}");
+                }
+            }
+        }
+    });
 }
 
 async fn serve_index() -> impl IntoResponse {
@@ -545,8 +1225,217 @@ async fn serve_index() -> impl IntoResponse {
     )
 }
 
+/// Liveness + busy probe. k8s probes only check the status code, so the
+/// JSON body is free for the cloud reaper's pre-pause busy check: it GETs
+/// this in-cluster and skips pausing a pod with a turn in flight
+/// (defense-in-depth alongside the busy keepalive heartbeat).
+/// job-artifacts Tier 1: opt-in Bearer gate for `/workspace/sync/*`.
+/// `THCLAWS_SYNC_REQUIRE_AUTH=1` → every sync request must carry the same
+/// `Authorization: Bearer $THCLAWS_API_TOKEN` as `/v1`. Unset/other → pass
+/// through (the classic trusted-network / ForwardAuth / multiuser-HMAC model).
+async fn sync_bearer_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // dev-plan/42+45 isolation: every `/workspace/sync/*` handler operates on
+    // `state.workspace`, which in a multiuser pod is the SHARED root holding
+    // every tenant's `workspace-<id>/`. `multiuser_auth` proves who the caller
+    // is but the handlers don't scope to them — so an authenticated co-tenant
+    // could pull a tarball of everyone's workspace (`.env`, `state/kms/`,
+    // sessions) or push over all of them. Per-tenant sync isn't defined for a
+    // shared workspace, so the surface is closed rather than half-scoped.
+    if crate::workdir::is_multiuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            "workspace sync is disabled on a multiuser workspace — /cloud push|pull operate on \
+             the whole pod directory, which is shared across tenants here",
+        )
+            .into_response();
+    }
+    let required = std::env::var("THCLAWS_SYNC_REQUIRE_AUTH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if required {
+        if let Err(resp) = crate::api_v1::check_bearer_headers(req.headers()) {
+            return resp;
+        }
+    }
+    next.run(req).await
+}
+
+/// Workspace root, captured at serve startup so `serve_health` (no `State`) can
+/// probe for detached background jobs. Set once in `run_with_engine`.
+static SERVE_WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// True if a detached background job is still running in the workspace. Any
+/// agent that spawns one drops a `<dir>/.jobs/<id>.json` carrying a live `pid`
+/// (course.py's `job start` does this); while any such pid is alive the cloud
+/// idle-reaper must NOT pause the pod — `/healthz` reports it as busy.
+fn background_jobs_alive() -> bool {
+    let Some(root) = SERVE_WORKSPACE.get() else {
+        return false;
+    };
+    fn scan(dir: &std::path::Path, depth: u8) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = e.file_name();
+            let p = e.path();
+            if name == ".jobs" {
+                if jobs_dir_has_live_pid(&p) {
+                    return true;
+                }
+            } else if depth > 0
+                && !matches!(
+                    name.to_str(),
+                    Some("node_modules" | "target" | ".git" | ".venv" | ".sync-trash")
+                )
+                && scan(&p, depth - 1)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    scan(root, 4)
+}
+
+fn jobs_dir_has_live_pid(dir: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let pid = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("pid").and_then(|x| x.as_i64()));
+        if let Some(pid) = pid {
+            if pid_alive(pid as i32) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    // kill(pid, 0): 0 → alive; EPERM → alive (not ours); ESRCH → dead.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+#[cfg(not(unix))]
+fn pid_alive(_pid: i32) -> bool {
+    false
+}
+
+#[cfg(all(test, unix))]
+mod background_job_probe_tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_self_true_bogus_false() {
+        assert!(pid_alive(std::process::id() as i32));
+        assert!(!pid_alive(2_147_480_000)); // a pid that won't exist
+        assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn jobs_dir_busy_only_when_a_pid_is_live() {
+        let d = tempfile::tempdir().unwrap();
+        let live = d.path().join("store/.jobs");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(
+            live.join("import-book.json"),
+            format!(
+                r#"{{"pid": {}, "argv": ["import-book"]}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        assert!(jobs_dir_has_live_pid(&live), "own pid should read as live");
+
+        let dead = d.path().join("other/.jobs");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("old.json"), r#"{"pid": 2147480000, "argv": []}"#).unwrap();
+        assert!(
+            !jobs_dir_has_live_pid(&dead),
+            "dead pid must not read as busy"
+        );
+    }
+}
+
 async fn serve_health() -> impl IntoResponse {
-    "ok"
+    let busy = crate::agent_activity::is_agent_busy() || background_jobs_alive();
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "busy": busy,
+        "busy_count": crate::agent_activity::busy_count(),
+    }))
+}
+
+/// `GET /gui-shell/<id>/` — serve a shell's index.html for Mode C
+/// (cloud serve / iframe-in-React-parent). Bridge runtime inlined so
+/// no relative-path resolution across traefik strip-prefixes.
+async fn serve_gui_shell_index(
+    axum::extract::Path(shell_id): axum::extract::Path<String>,
+) -> Response {
+    let shell = match crate::gui_shell::serve::resolve_bound_shell(&shell_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(axum::body::Body::from("shell not found"))
+                .expect("build 404");
+        }
+    };
+    crate::gui_shell::serve::serve_shell_index_inline(&shell)
+}
+
+/// `GET /gui-shell/<id>/<rel>` — serve a shell asset. Sandbox-checked
+/// against the shell folder by `serve_shell_asset`.
+async fn serve_gui_shell_asset(
+    axum::extract::Path((shell_id, rel)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let shell = match crate::gui_shell::serve::resolve_bound_shell(&shell_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(axum::body::Body::from("shell not found"))
+                .expect("build 404");
+        }
+    };
+    crate::gui_shell::serve::serve_shell_asset(&shell, &rel)
+}
+
+/// `GET /file-asset/<rel>` — serve a workspace-relative file so GUI
+/// shells can render agent-produced output (image-batch's
+/// `images/<slug>/*.png`, generated PDFs, contact-sheet HTML, etc.)
+/// via plain `<img src>` / `<a href>` tags. Path is
+/// `Sandbox::check_in`-validated against the current cwd so a
+/// crafted `../etc/passwd` can't escape. Single-tenant per --serve
+/// process; multi-tenant adds HMAC in `build_shell_router`.
+async fn serve_file_asset(
+    axum::extract::Path(rel): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    crate::gui_shell::serve::serve_project_asset(&cwd, &rel, range)
 }
 
 /// `POST /upload` — multipart file upload from the --serve browser
@@ -561,19 +1450,34 @@ async fn serve_health() -> impl IntoResponse {
 /// so the frontend can show a confirmation chip per file. Caps:
 /// [`UPLOAD_MAX_BYTES`] per file, [`UPLOAD_MAX_FILES`] per request.
 /// Oversize / overflow is rejected with 413.
+/// `?dir=<rel>` lets a caller (e.g. a GUI shell staging files) drop the
+/// upload into a specific workspace subfolder instead of `uploads/`.
+/// When set, the chat-message synthesis is skipped — the files are
+/// staged silently for the shell to act on, not announced to the agent.
+#[derive(serde::Deserialize, Default)]
+struct UploadQuery {
+    dir: Option<String>,
+}
+
 async fn serve_upload(
     State(state): State<ServeState>,
+    Query(q): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let workspace = state.workspace.as_ref();
-    let uploads_dir = match ensure_uploads_dir(workspace) {
+    let target_dir = q.dir.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let uploads_dir = match target_dir {
+        Some(rel) => ensure_target_dir(workspace, rel),
+        None => ensure_uploads_dir(workspace),
+    };
+    let uploads_dir = match uploads_dir {
         Ok(p) => p,
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "ok": false,
-                    "error": format!("cannot create uploads dir: {e}"),
+                    "error": format!("cannot use upload dir: {e}"),
                 })),
             )
                 .into_response();
@@ -668,8 +1572,14 @@ async fn serve_upload(
             .into_response();
     }
 
-    let synth = render_upload_message("serve", &saved);
-    let _ = state.shared.input_tx.send(ShellInput::Line(synth));
+    // Only announce uploads to the agent for the default `uploads/`
+    // drop. A `?dir=` upload is the shell staging files for itself
+    // (e.g. book-author's raw/ sources) — synthesizing a turn here
+    // would make the agent react to files it isn't meant to see yet.
+    if target_dir.is_none() {
+        let synth = render_upload_message("serve", &saved);
+        let _ = state.shared.input_tx.send(ShellInput::Line(synth));
+    }
 
     let files: Vec<serde_json::Value> = saved
         .iter()
@@ -725,11 +1635,14 @@ fn verify_file_asset_for_user(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let user_id = crate::multi_tenant::verify_user_header(
+    let user_id = crate::multi_tenant::verify_identity(
         user_id_h,
         ts_h,
         proof_h,
-        &mt.hmac_secret,
+        headers
+            .get("x-thclaws-user-sig")
+            .and_then(|v| v.to_str().ok()),
+        &mt.verifier,
         now_secs,
     )
     .map_err(|e| {
@@ -776,18 +1689,35 @@ fn resolve_session_handle(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let user_id = crate::multi_tenant::verify_user_header(
+    let user_id = crate::multi_tenant::verify_identity(
         user_id_h,
         ts_h,
         proof_h,
-        &mt.hmac_secret,
+        headers
+            .get("x-thclaws-user-sig")
+            .and_then(|v| v.to_str().ok()),
+        &mt.verifier,
         now_secs,
     )
     .map_err(|e| {
         eprintln!("\x1b[33m[serve] HMAC rejected: {e}\x1b[0m");
         StatusCode::UNAUTHORIZED
     })?;
-    let session = mt.registry.get_or_spawn(&user_id);
+    // Display name is NOT part of the signed triple — it's advisory,
+    // for greeting the user. The id is what's authenticated.
+    // Percent-encoded UTF-8: HTTP header values are latin-1 and most of
+    // our users have Thai names, so the API encodes and we decode. A
+    // malformed value degrades to no name rather than failing the
+    // connection — it's a greeting, not an auth input.
+    let display_name = headers
+        .get("x-thclaws-user-name")
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| {
+            urlencoding::decode(raw)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| raw.to_string())
+        });
+    let session = mt.registry.get_or_spawn(&user_id, display_name.as_deref());
     Ok(session.handle.clone())
 }
 
@@ -800,6 +1730,12 @@ fn resolve_session_handle(
 /// only) so the IpcContext + handle_ipc plumbing can be smoke-tested
 /// before the rendering layer is wired.
 async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedSessionHandle>) {
+    // Tick the cloud-heartbeat counter for the lifetime of this socket.
+    // `_ws_guard` decrements on drop so panics / early returns can't
+    // leak a stale count. The cloud heartbeat task reads this to
+    // decide whether to ping keepalive on every 60s tick.
+    let _ws_guard = WsGuard::new(state.ws_connections.clone());
+
     let (mut sink, mut stream) = socket.split();
     // Outbound channel: every dispatch closure invocation lands here;
     // a single task drains it to the sink so concurrent dispatches
@@ -827,7 +1763,11 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             let _ = tx.send(payload);
         })
     };
+    // dev-plan/42: capture the resolved (per-user) session roots for the
+    // initial-state snapshot closure below.
+    let initial_session_roots = shared.session_roots.clone();
     let ctx = IpcContext {
+        is_serve_mode: true,
         // dev-plan/35 Tier 1: `shared` here is the RESOLVED handle
         // (per-user in multi-tenant mode; the default in single-
         // tenant mode). Subsequent state.shared references below
@@ -843,8 +1783,23 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
             );
         }),
         on_send_initial_state: Arc::new(move || {
-            let payload = build_initial_state_payload();
+            // dev-plan/42: per-user sessions dir from the resolved handle
+            // (multiuser) so the snapshot lists this user's history.
+            let sessions_dir = initial_session_roots
+                .as_ref()
+                .map(|r: &crate::multi_tenant::SessionRoots| r.sessions_dir.clone());
+            let payload = build_initial_state_payload(sessions_dir.clone());
             let _ = initial_dispatch(payload);
+            // Hydrate a chat-first gui-shell (`<thc-chat>`) with the active
+            // session's transcript on (re)connect. The worker's input queue
+            // only drains between turns, so we read the session from disk
+            // here rather than asking the worker to re-emit — a browser
+            // reconnecting MID-run gets its history immediately instead of
+            // after the (possibly minutes-long) turn finishes. Targeted to
+            // THIS client; no broadcast, no worker involvement.
+            if let Some(hist) = build_gui_shell_history_payload(sessions_dir) {
+                let _ = initial_dispatch(hist);
+            }
         }),
         on_zoom: Arc::new(|_scale| {
             // Browser handles its own zoom (Cmd-+/-); no server-side
@@ -870,12 +1825,43 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
                 // Slow consumer dropped frames; resume — the agent
                 // re-asks on retry, and lagged ask-frames are no
                 // worse than the pre-fix state (which was complete
-                // silence).
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // silence). Log the drop so lag is diagnosable
+                // (issue #163 Bug 1) rather than vanishing silently.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("[event_forwarder:ws] lagged: dropped {n} events");
+                    continue;
+                }
                 Err(_) => return,
             }
         }
     });
+
+    // Surface a one-time permission notice (e.g. a multiuser pod where a
+    // configured "ask" was overridden to auto-approve) as a chat/system line
+    // so the user understands why their setting wasn't honored.
+    if let Some(notice) = &state.permission_notice {
+        for dispatch in render_chat_dispatches(&ViewEvent::SlashOutput(notice.clone())) {
+            let _ = out_tx.send(dispatch);
+        }
+    }
+
+    // Re-emit any STILL-PENDING approval requests to this freshly-connected
+    // client. The broadcast above only reaches tabs connected at the moment
+    // a request fires, so a browser that connects later — e.g. after the
+    // user refreshes mid-turn — would never see the modal and the turn would
+    // stay hung. Replaying the unresolved set lets the reconnected tab
+    // approve and unblock it.
+    for req in state.approver.unresolved_requests() {
+        let payload = serde_json::json!({
+            "type": "approval_request",
+            "id": req.id,
+            "tool_name": req.tool_name,
+            "input": req.input,
+            "summary": req.summary,
+            "originator": req.originator,
+        });
+        let _ = out_tx.send(payload.to_string());
+    }
 
     // M6.36 SERVE3: subscribe to the broadcast and translate every
     // ViewEvent into chat-shaped + terminal-shaped envelopes, identical
@@ -929,10 +1915,11 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Slow consumer dropped events; ignore and resume
-                    // — Phase 1A reconnect-with-snapshot-replay will
-                    // re-sync state on next ws drop.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Slow consumer dropped events; log + resume —
+                    // reconnect-with-snapshot-replay re-syncs state on
+                    // the next ws drop (issue #163 Bug 1).
+                    eprintln!("[event_forwarder:ws] lagged: dropped {n} events");
                     continue;
                 }
                 Err(_) => break,
@@ -974,26 +1961,25 @@ async fn handle_socket(socket: WebSocket, state: ServeState, shared: Arc<SharedS
 /// fresh from disk on every WS connect so an F5 refresh always
 /// reflects the current `AppConfig` / sessions / MCP / KMS state.
 ///
-/// Auto-fallback model: if the saved model's provider has no
-/// credentials but another provider does, switch + persist so the
-/// "ready" indicator in the sidebar is accurate after the user adds
-/// a key.
-fn build_initial_state_payload() -> String {
-    let mut config = AppConfig::load().unwrap_or_default();
-    if let Some(new_model) = crate::providers::auto_fallback_model(&config) {
-        let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
-        project.set_model(&new_model);
-        let _ = project.save();
-        config = AppConfig::load().unwrap_or_default();
-    }
+/// Reports the saved model's readiness as-is — no auto-switch. The
+/// previous behaviour rewrote settings.json to a local runtime whenever
+/// the active provider lacked credentials, without probing that the
+/// runtime existed; see the matching note in gui.rs's SendInitialState.
+fn build_initial_state_payload(sessions_dir: Option<std::path::PathBuf>) -> String {
+    let config = AppConfig::load().unwrap_or_default();
     let provider_name = config.detect_provider().unwrap_or("unknown");
     let provider_ready = provider_has_credentials(&config);
     // Consult the live MCP_TOOL_COUNTS cache (populated by the
     // McpReady worker event) so reconnect-after-startup ships real
     // counts instead of the hardcoded zeros that surfaced as issue #86.
     let mcp_servers = crate::gui::build_mcp_servers_payload(&config);
-    let sessions: Vec<serde_json::Value> = SessionStore::default_path()
+    // dev-plan/42: in multiuser `--serve` the WS-connect snapshot must
+    // list THIS user's sessions (their per-user `sessions_dir`), not the
+    // process-cwd default (the owner's shared `/workspace/.thclaws/
+    // sessions/`). `None` → single-tenant default.
+    let sessions: Vec<serde_json::Value> = sessions_dir
         .map(SessionStore::new)
+        .or_else(|| SessionStore::default_path().map(SessionStore::new))
         .and_then(|store| store.list().ok())
         .unwrap_or_default()
         .into_iter()
@@ -1008,14 +1994,22 @@ fn build_initial_state_payload() -> String {
         })
         .collect();
     let kmss = build_kms_initial_payload(&config);
-    // #95(c): on WS open the frontend's mount-time `team_enabled_get`
-    // request can be dropped if the socket is still CONNECTING — the
-    // wsSend guard logs and discards (frontend/src/hooks/useIPC.ts:114).
-    // Ship the flag here so every (re)connect-driven initial_state
-    // carries it and the Team tab heals automatically without the user
-    // having to open Settings to incidentally refire the get.
-    let team_enabled = crate::config::ProjectConfig::load()
+    // #95(c) + #168: the frontend's mount-time tab-visibility `*_get`
+    // requests (team / shell / browser) can be dropped if the socket is
+    // still CONNECTING — the wsSend guard logs and discards
+    // (frontend/src/hooks/useIPC.ts). That race is far more likely over a
+    // high-latency tunnel (e.g. ngrok), which left the Browser/Shell tabs
+    // hidden there but visible on localhost. Ship every flag in the
+    // (re)connect-driven initial_state so the tabs self-heal regardless of
+    // WS timing, without the user re-firing the get via Settings.
+    let project = crate::config::ProjectConfig::load();
+    let team_enabled = project
+        .as_ref()
         .and_then(|c| c.team_enabled)
+        .unwrap_or(false);
+    let shell_tab_enabled = project
+        .as_ref()
+        .and_then(|c| c.shell_tab_enabled)
         .unwrap_or(false);
     serde_json::json!({
         "type": "initial_state",
@@ -1026,9 +2020,48 @@ fn build_initial_state_payload() -> String {
         "sessions": sessions,
         "kmss": kmss,
         "team_enabled": team_enabled,
+        "shell_tab_enabled": shell_tab_enabled,
+        "browser_enabled": config.browser_enabled,
+        // Whether the worker has an agent turn in flight RIGHT NOW. A
+        // browser that (re)connects mid-turn — e.g. after detaching during
+        // a long TextToSpeech/video render — must restore its "working"
+        // indicator, otherwise the still-running turn looks stopped even
+        // though it keeps producing output server-side and the result
+        // streams in when it finishes. The frontend re-subscribes to the
+        // live event stream on connect, so the terminal `done` clears it.
+        "agent_busy": crate::agent_activity::is_agent_busy(),
         "version": crate::version::VERSION,
     })
     .to_string()
+}
+
+/// Build the `gui_shell_event`/`history` envelope for the active session so
+/// a reconnecting chat-first shell (`<thc-chat>`) repaints its transcript.
+///
+/// The "active" session is the most-recent non-empty one on disk — in
+/// serve single-tenant the running turn keeps saving it, so it IS the
+/// worker's current session. This mirrors the frontend's dev-plan/36
+/// "restore most-recent non-empty session" heuristic (App.tsx), just for
+/// the gui-shell path. Reads disk (not the turn-blocked worker queue), so
+/// it works even while a run is streaming — completed turns come from the
+/// file, the in-flight turn keeps streaming live over the same WS.
+/// `None` when there's no non-empty session (fresh workspace) so the
+/// shell's own intro/"Welcome" line stands.
+fn build_gui_shell_history_payload(sessions_dir: Option<std::path::PathBuf>) -> Option<String> {
+    let store = sessions_dir
+        .map(SessionStore::new)
+        .or_else(|| SessionStore::default_path().map(SessionStore::new))?;
+    let meta = store
+        .list()
+        .ok()?
+        .into_iter()
+        .find(|m| m.message_count > 0)?;
+    let session = store.load(&meta.id).ok()?;
+    let display = crate::shared_session::DisplayMessage::from_session(&session);
+    if display.is_empty() {
+        return None;
+    }
+    Some(crate::event_render::gui_shell_history_envelope(&display))
 }
 
 /// KMS list for the initial-state payload. Mirrors the structure
@@ -1050,10 +2083,7 @@ fn build_kms_initial_payload(config: &AppConfig) -> Vec<serde_json::Value> {
             // Already saw this name in a higher-priority scope.
             continue;
         }
-        let scope = match kref.scope {
-            crate::kms::KmsScope::Project => "project",
-            crate::kms::KmsScope::User => "user",
-        };
+        let scope = kref.scope.as_str();
         let active_flag = active.contains(kref.name.as_str());
         all.push((kref.name, scope, active_flag));
     }
@@ -1095,20 +2125,18 @@ mod tests {
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
-        // Bind to an OS-assigned port so concurrent test runs don't
-        // collide. We pre-bind a TcpListener to discover the port,
-        // then drop the listener and let server::run rebind. Tiny
-        // window for race; in practice fine for unit tests.
+        // Bind port 0 and KEEP the listener, handing it to the server.
+        // Dropping it to let `run` re-bind used to lose the port to another
+        // test in the parallel suite often enough to fail ~1 run in 3.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
         let cfg = ServeConfig {
             bind: addr,
             ..Default::default()
         };
         let server_handle = tokio::spawn(async move {
-            let _ = run(cfg).await;
+            let _ = run_on(cfg, listener).await;
         });
 
         // Give the server a beat to bind. Healthz poll loop catches
@@ -1232,10 +2260,10 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(json["ok"], serde_json::Value::Bool(true));
-        assert_eq!(json["files"][0]["path"], "uploads/photo.jpg");
+        assert_eq!(json["files"][0]["path"], "_uploads/photo.jpg");
         assert_eq!(json["files"][0]["size"], 16);
 
-        assert!(td.path().join("uploads").join("photo.jpg").exists());
+        assert!(td.path().join("_uploads").join("photo.jpg").exists());
 
         // Second upload with the same name → `_1` suffix.
         let part_b = reqwest::multipart::Part::bytes(vec![1u8; 8])
@@ -1251,8 +2279,186 @@ mod tests {
             .expect("upload POST 2");
         assert_eq!(resp2.status(), reqwest::StatusCode::OK);
         let json2: serde_json::Value = resp2.json().await.unwrap();
-        assert_eq!(json2["files"][0]["path"], "uploads/photo_1.jpg");
-        assert!(td.path().join("uploads").join("photo_1.jpg").exists());
+        assert_eq!(json2["files"][0]["path"], "_uploads/photo_1.jpg");
+        assert!(td.path().join("_uploads").join("photo_1.jpg").exists());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_with_dir_param_saves_to_subdirectory() {
+        use std::time::Duration;
+
+        let td = tempfile::tempdir().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = ServeConfig {
+            bind: addr,
+            workspace: Some(td.path().to_path_buf()),
+            gui_shell: None,
+            multi_tenant: None,
+        };
+        let server_handle = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        let healthz_url = format!("http://{addr}/healthz");
+        for _ in 0..50 {
+            if reqwest::get(&healthz_url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let upload_url = format!("http://{addr}/upload?dir=raw");
+        let part = reqwest::multipart::Part::bytes(vec![0u8; 16])
+            .file_name("photo.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let resp = reqwest::Client::new()
+            .post(&upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .expect("upload POST with dir param");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["ok"], serde_json::Value::Bool(true));
+        assert_eq!(json["files"][0]["path"], "raw/photo.jpg");
+
+        assert!(td.path().join("raw").join("photo.jpg").exists());
+        assert!(!td.path().join("uploads").exists());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_with_dir_param_collision_suffix() {
+        use std::time::Duration;
+
+        let td = tempfile::tempdir().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = ServeConfig {
+            bind: addr,
+            workspace: Some(td.path().to_path_buf()),
+            gui_shell: None,
+            multi_tenant: None,
+        };
+        let server_handle = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        let healthz_url = format!("http://{addr}/healthz");
+        for _ in 0..50 {
+            if reqwest::get(&healthz_url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let upload_url = format!("http://{addr}/upload?dir=raw");
+
+        let part_a = reqwest::multipart::Part::bytes(vec![0u8; 16])
+            .file_name("photo.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let resp_a = reqwest::Client::new()
+            .post(&upload_url)
+            .multipart(reqwest::multipart::Form::new().part("file", part_a))
+            .send()
+            .await
+            .expect("upload POST 1");
+        assert_eq!(resp_a.status(), reqwest::StatusCode::OK);
+        let json_a: serde_json::Value = resp_a.json().await.unwrap();
+        assert_eq!(json_a["files"][0]["path"], "raw/photo.jpg");
+
+        let part_b = reqwest::multipart::Part::bytes(vec![1u8; 8])
+            .file_name("photo.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let resp_b = reqwest::Client::new()
+            .post(&upload_url)
+            .multipart(reqwest::multipart::Form::new().part("file", part_b))
+            .send()
+            .await
+            .expect("upload POST 2");
+        assert_eq!(resp_b.status(), reqwest::StatusCode::OK);
+        let json_b: serde_json::Value = resp_b.json().await.unwrap();
+        assert_eq!(json_b["files"][0]["path"], "raw/photo_1.jpg");
+
+        assert!(td.path().join("raw").join("photo_1.jpg").exists());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_with_dir_escape_rejected() {
+        use std::time::Duration;
+
+        let td = tempfile::tempdir().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = ServeConfig {
+            bind: addr,
+            workspace: Some(td.path().to_path_buf()),
+            gui_shell: None,
+            multi_tenant: None,
+        };
+        let server_handle = tokio::spawn(async move {
+            let _ = run(cfg).await;
+        });
+
+        let healthz_url = format!("http://{addr}/healthz");
+        for _ in 0..50 {
+            if reqwest::get(&healthz_url).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // `..` component must be rejected.
+        let part = reqwest::multipart::Part::bytes(vec![0u8; 8])
+            .file_name("evil.txt")
+            .mime_str("text/plain")
+            .unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/upload?dir=../etc"))
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .expect("upload POST with path traversal");
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["ok"], serde_json::Value::Bool(false));
+
+        // Leading `/` is stripped by ensure_target_dir (trim_matches('/')),
+        // so `/absolute` is treated as the subdirectory `absolute` — not rejected.
+        let part2 = reqwest::multipart::Part::bytes(vec![0u8; 8])
+            .file_name("file.txt")
+            .mime_str("text/plain")
+            .unwrap();
+        let resp2 = reqwest::Client::new()
+            .post(format!("http://{addr}/upload?dir=/absolute"))
+            .multipart(reqwest::multipart::Form::new().part("file", part2))
+            .send()
+            .await
+            .expect("upload POST with leading slash");
+        assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+        let json2: serde_json::Value = resp2.json().await.unwrap();
+        assert_eq!(json2["ok"], serde_json::Value::Bool(true));
+        assert_eq!(json2["files"][0]["path"], "absolute/file.txt");
 
         server_handle.abort();
     }
@@ -1290,6 +2496,8 @@ mod tests {
             ask_broadcast,
             workspace: std::sync::Arc::new(std::env::temp_dir()),
             multi_tenant,
+            ws_connections: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            permission_notice: None,
         }
     }
 
@@ -1304,10 +2512,15 @@ mod tests {
                 // checks that never write per-user state — temp_dir
                 // is fine, nothing lands on disk.
                 project_root: std::env::temp_dir(),
+                workspaces_base: None,
+                def_source: None,
+                owner_user_id: None,
             });
         MultiTenantState {
             registry,
-            hmac_secret: std::sync::Arc::new(TEST_SECRET.to_vec()),
+            verifier: std::sync::Arc::new(crate::multi_tenant::IdentityVerifier::Hmac {
+                secret: TEST_SECRET.to_vec(),
+            }),
         }
     }
 
@@ -1322,6 +2535,74 @@ mod tests {
         headers.insert("x-thclaws-user-ts", ts.to_string().parse().unwrap());
         headers.insert("x-thclaws-user-proof", proof.parse().unwrap());
         headers
+    }
+
+    // dev-plan/42: the global multiuser auth gate.
+    #[test]
+    fn multiuser_auth_requires_valid_identity_on_every_route() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let empty = HeaderMap::new();
+
+        let v = crate::multi_tenant::IdentityVerifier::Hmac {
+            secret: TEST_SECRET.to_vec(),
+        };
+        let wrong = crate::multi_tenant::IdentityVerifier::Hmac {
+            secret: b"a-different-secret".to_vec(),
+        };
+        // No identity → rejected on a normal route.
+        assert!(!multiuser_request_authed("/", &empty, &v, now));
+        assert!(!multiuser_request_authed(
+            "/v1/chat/completions",
+            &empty,
+            &v,
+            now
+        ));
+        // Health probe is exempt (k8s has no identity to present).
+        assert!(multiuser_request_authed("/healthz", &empty, &v, now));
+        // Valid signed identity → allowed.
+        assert!(multiuser_request_authed(
+            "/",
+            &headers_for("alice"),
+            &v,
+            now
+        ));
+        // Wrong secret → forged → rejected.
+        assert!(!multiuser_request_authed(
+            "/",
+            &headers_for("alice"),
+            &wrong,
+            now
+        ));
+        // dev-plan/45 B: a pubkey-configured pod REQUIRES the Ed25519
+        // sig — a valid HMAC triple alone no longer passes.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let ed = crate::multi_tenant::IdentityVerifier::Ed25519 {
+            key: sk.verifying_key(),
+        };
+        assert!(!multiuser_request_authed(
+            "/",
+            &headers_for("alice"),
+            &ed,
+            now
+        ));
+        let mut signed = headers_for("alice");
+        let ts: u64 = signed["x-thclaws-user-ts"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        use ed25519_dalek::Signer;
+        let sig = sk.sign(format!("alice:{ts}").as_bytes());
+        signed.insert(
+            "x-thclaws-user-sig",
+            crate::multi_tenant::auth::hex_encode(&sig.to_bytes())
+                .parse()
+                .unwrap(),
+        );
+        assert!(multiuser_request_authed("/", &signed, &ed, now));
     }
 
     #[test]

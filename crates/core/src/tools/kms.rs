@@ -19,6 +19,19 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 
+/// Refuse a mutation against a read-only shared-agent KMS (dev-plan/41).
+/// The company brain is mounted read-only; members fork the agent to
+/// change its knowledge. Reads/searches are unaffected.
+fn deny_if_read_only(kref: &crate::kms::KmsRef) -> Result<()> {
+    if kref.read_only() {
+        return Err(Error::Tool(format!(
+            "KMS '{}' belongs to a shared agent and is read-only — fork the agent to edit its knowledge",
+            kref.name
+        )));
+    }
+    Ok(())
+}
+
 pub struct KmsReadTool;
 
 #[async_trait]
@@ -257,6 +270,14 @@ fn kms_search_query_path(
     query: &str,
     input: &Value,
 ) -> Result<String> {
+    // dev-plan/41: a shared KMS is mounted read-only, so the BM25 index
+    // (written under `<root>/.index`) can't be built there — auto-rebuild
+    // would EROFS. Fall back to a read-only literal line-grep so `query:`
+    // still works on shared KMSes (degraded: no ranking, but no writes).
+    if kref.read_only() {
+        return kms_search_pattern_path(kref, _kms_name, &regex::escape(query));
+    }
+
     // Parse optional filters.
     let tags: Vec<String> = input
         .get("tags")
@@ -548,6 +569,7 @@ impl Tool for KmsWriteTool {
                 "no KMS named '{kms_name}' (check /kms list)"
             )));
         };
+        deny_if_read_only(&kref)?;
         // Pre-flight provenance check: pages without `sources:` in
         // frontmatter still write (soft enforcement keeps the tool
         // usable for legacy / quick captures), but the response
@@ -562,6 +584,77 @@ impl Tool for KmsWriteTool {
             Some(w) => format!("{base}\nwarning: {w}"),
             None => base,
         })
+    }
+}
+
+/// Cache a fetched web source into a KMS's `sources/` directory (layer-1: the
+/// raw input, distinct from the synthesized `pages/`). Mirrors what the built-in
+/// `/research` pipeline does via `research::kms_writer::write_source`, so an
+/// agent-driven research workflow can leave the same offline provenance trail.
+pub struct KmsWriteSourceTool;
+
+#[async_trait]
+impl Tool for KmsWriteSourceTool {
+    fn name(&self) -> &'static str {
+        "KmsWriteSource"
+    }
+
+    fn description(&self) -> &'static str {
+        "Save a fetched web source into a knowledge base's `sources/` directory \
+         as an OFFLINE reference — KMS layer-1 (the raw input the synthesis \
+         stands on), separate from the LLM-authored `pages/`. Call once per cited \
+         source so the KMS holds both the note and its sources. The filename is a \
+         deterministic slug of the URL (same URL → same file; the latest fetch \
+         wins). In the page's `## Sources` list, link each entry to \
+         `../sources/<slug>.md` alongside the upstream URL so citations resolve \
+         to the local copy. Requires an existing KMS."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kms":     {"type": "string", "description": "KMS name (must already exist — KmsCreate first)"},
+                "url":     {"type": "string", "description": "The source's upstream URL (also the filename slug)"},
+                "title":   {"type": "string", "description": "Human-readable source title"},
+                "content": {"type": "string", "description": "The fetched source text to cache offline (the substantive extracted content the LLM saw)"},
+                "index":   {"type": "integer", "description": "Optional [N] citation index this source has in the page"},
+                "query":   {"type": "string", "description": "Optional research query this fetch was for (provenance)"}
+            },
+            "required": ["kms", "url", "title", "content"]
+        })
+    }
+
+    fn requires_approval(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value) -> Result<String> {
+        let kms_name = req_str(&input, "kms")?;
+        let url = req_str(&input, "url")?;
+        let title = req_str(&input, "title")?;
+        let content = req_str(&input, "content")?;
+        let index = input.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let query = input.get("query").and_then(Value::as_str).unwrap_or("");
+        crate::workflow::check_kms_write_capability(kms_name)?;
+        let Some(kref) = crate::kms::resolve(kms_name) else {
+            return Err(Error::Tool(format!(
+                "no KMS named '{kms_name}' (check /kms list)"
+            )));
+        };
+        deny_if_read_only(&kref)?;
+        let today = crate::research::kms_writer::today_str();
+        let path = crate::research::kms_writer::write_source(
+            kms_name, query, &today, index, title, url, content,
+        )?;
+        // Return the KMS-relative `sources/<file>` so the caller can link the
+        // page's ## Sources entry to `../sources/<file>` deterministically.
+        let rel = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|f| format!("sources/{f}"))
+            .unwrap_or_else(|| path.display().to_string());
+        Ok(format!("cached source → {rel} ({} bytes)", content.len()))
     }
 }
 
@@ -639,6 +732,7 @@ impl Tool for KmsAppendTool {
                 "no KMS named '{kms_name}' (check /kms list)"
             )));
         };
+        deny_if_read_only(&kref)?;
         let path = crate::kms::append_to_page(&kref, page, content)?;
         Ok(format!(
             "appended {} bytes to {}",
@@ -693,6 +787,7 @@ impl Tool for KmsDeleteTool {
                 "no KMS named '{kms_name}' (check /kms list)"
             )));
         };
+        deny_if_read_only(&kref)?;
         let path = crate::kms::delete_page(&kref, page)?;
         Ok(format!("deleted {}", path.display()))
     }
@@ -742,10 +837,10 @@ impl Tool for KmsCreateTool {
                 "scope": {
                     "type": "string",
                     "enum": ["project", "user"],
-                    "description": "'project' = ./.thclaws/kms/<name> (per-workspace); 'user' = ~/.config/thclaws/kms/<name> (global). /dream uses 'project'."
+                    "description": "Optional. 'project' = ./.thclaws/kms/<name> (per-workspace, the default and correct choice for almost everything — research, /dream, ingest); 'user' = ~/.config/thclaws/kms/<name> (global, opt-in only). OMIT to get the project default: an unqualified create reuses any same-named KMS that already exists, else creates it project-scoped. Only pass 'user' when the user explicitly wants a cross-project global base."
                 }
             },
-            "required": ["name", "scope"]
+            "required": ["name"]
         })
     }
 
@@ -759,22 +854,62 @@ impl Tool for KmsCreateTool {
         // subagent call requires the new name to be in the granted
         // write list — same gate as Write/Append/Delete.
         crate::workflow::check_kms_write_capability(name)?;
-        let scope_str = req_str(&input, "scope")?;
-        let scope = match scope_str {
-            "project" => crate::kms::KmsScope::Project,
-            "user" => crate::kms::KmsScope::User,
-            other => {
+        // Scope is optional. Omitted → project default via `ensure_default`
+        // (reuse any existing same-named KMS, else create project-scoped) so
+        // an agent that doesn't pin a scope can't spawn a user-scope duplicate
+        // shadowing the project KMS. Only an explicit "user" opts into global.
+        let scope_opt = input
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (kref, scope) = match scope_opt {
+            None => {
+                let k = crate::kms::ensure_default(name)?;
+                let s = k.scope;
+                (k, s)
+            }
+            Some("project") => {
+                let s = crate::kms::KmsScope::Project;
+                (crate::kms::create(name, s)?, s)
+            }
+            Some("user") => {
+                let s = crate::kms::KmsScope::User;
+                (crate::kms::create(name, s)?, s)
+            }
+            Some(other) => {
                 return Err(Error::Tool(format!(
                     "invalid scope '{other}' — must be 'project' or 'user'"
                 )))
             }
         };
-        let kref = crate::kms::create(name, scope)?;
+        // Auto-attach a freshly-created PROJECT KMS to the active set
+        // (idempotent, best-effort) so the new base is grounded into future
+        // turns without a manual `/kms use` — e.g. after a research run persists
+        // its page, that knowledge base is live in the next session. Best-effort:
+        // a settings-write failure must not fail the create. User-scope KMSes are
+        // cross-project, so the user opts those in per-project instead.
+        let mut activated = false;
+        if matches!(scope, crate::kms::KmsScope::Project) {
+            let mut active = crate::config::ProjectConfig::load()
+                .and_then(|c| c.kms)
+                .map(|k| k.active)
+                .unwrap_or_default();
+            if !active.iter().any(|k| k == name) {
+                active.push(name.to_string());
+                activated = crate::config::ProjectConfig::set_active_kms(active).is_ok();
+            }
+        }
         Ok(format!(
-            "ensured KMS '{}' ({}) at {}",
+            "ensured KMS '{}' ({}) at {}{}",
             kref.name,
             scope.as_str(),
-            kref.root.display()
+            kref.root.display(),
+            if activated {
+                " · attached to active set"
+            } else {
+                ""
+            }
         ))
     }
 }
@@ -1171,6 +1306,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_tool_defaults_to_project_when_scope_omitted() {
+        let _home = scoped_home();
+        // No "scope" field — an agent that forgets it must NOT land in user
+        // scope. Ships project-scoped (the two-identical-KMS-entries fix).
+        let out = KmsCreateTool.call(json!({ "name": "kb" })).await.unwrap();
+        assert!(out.contains("project"), "got: {out}");
+        let kref = crate::kms::resolve("kb").expect("kb should resolve");
+        assert_eq!(kref.scope, crate::kms::KmsScope::Project);
+    }
+
+    #[tokio::test]
+    async fn create_tool_omitted_scope_reuses_existing_user_kms() {
+        let _home = scoped_home();
+        // A user-scope "kb" already exists; an unqualified create reuses it
+        // instead of minting a project duplicate.
+        crate::kms::create("kb", crate::kms::KmsScope::User).unwrap();
+        KmsCreateTool.call(json!({ "name": "kb" })).await.unwrap();
+        assert_eq!(
+            crate::kms::list_all()
+                .iter()
+                .filter(|r| r.name == "kb")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn create_tool_is_idempotent() {
         let _home = scoped_home();
         let first = KmsCreateTool
@@ -1184,7 +1346,12 @@ mod tests {
             .call(json!({"name": "dreams", "scope": "project"}))
             .await
             .unwrap();
-        assert_eq!(first, second);
+        // Idempotent on the KMS itself — both calls ensure the same store at
+        // the same path. Only the FIRST call attaches it to the active set, so
+        // the second omits the "· attached to active set" suffix; compare the
+        // path-bearing core rather than the exact message.
+        let core = |s: &str| s.split(" · attached").next().unwrap().to_string();
+        assert_eq!(core(&first), core(&second));
     }
 
     #[tokio::test]

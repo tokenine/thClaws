@@ -7,6 +7,31 @@ use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Current terminal column count, used to fit spinner labels within
+/// one row (otherwise `\r` overwrite breaks on line-wrap — see #138).
+/// Returns 80 when stdout isn't a tty or the OS query fails. The
+/// `terminal_size` crate wraps `TIOCGWINSZ` on Unix and
+/// `GetConsoleScreenBufferInfo` on Windows so we don't have to
+/// hand-roll cross-platform unsafe.
+fn terminal_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .filter(|w| *w > 0)
+        .unwrap_or(80)
+}
+
+fn fit_label(label: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = label.chars().count();
+    if len > width {
+        truncate(label, width.saturating_sub(1))
+    } else {
+        format!("{label:<width$}")
+    }
+}
+
 // ── constants ──────────────────────────────────────────────────────
 
 /// Maximum visible characters for a tool preview inside brackets.
@@ -77,6 +102,30 @@ fn redact_secrets(s: &str) -> String {
     let mut out = s.to_string();
     for pat in redaction_patterns() {
         out = pat.regex.replace_all(&out, pat.replacement).into_owned();
+    }
+    redact_paths(&out)
+}
+
+/// Replace absolute filesystem paths with relative/short forms so the
+/// user's working directory and home directory don't leak into labels,
+/// previews, or approval prompts. The working dir collapses to `.` and
+/// the home dir to `~`. cwd is tried first since it is usually the
+/// longer (more specific) prefix and may live under home.
+fn redact_paths(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = cwd.to_str() {
+            if cwd.len() > 1 {
+                out = out.replace(cwd, ".");
+            }
+        }
+    }
+    if let Some(home) = crate::util::home_dir() {
+        if let Some(home) = home.to_str() {
+            if home.len() > 1 {
+                out = out.replace(home, "~");
+            }
+        }
     }
     out
 }
@@ -149,6 +198,7 @@ fn preview(s: &str, cap: usize) -> String {
 /// - `Read (crates/core/src/repl.rs)`
 /// - `Grep (ToolCallStart)`
 /// - `WebFetch (https://example.com/…)`
+/// - `FetchImages (articles/…/article.md)`
 /// - `Task (agent=dev-glm)`
 /// - fallback: `ToolName`
 pub(crate) fn tool_label(name: &str, input: &serde_json::Value) -> String {
@@ -170,10 +220,14 @@ pub(crate) fn tool_label(name: &str, input: &serde_json::Value) -> String {
             .get("pattern")
             .and_then(|v| v.as_str())
             .map(|p| preview(p, PREVIEW_CAP)),
-        "WebFetch" => input
+        "WebFetch" | "WebScrape" | "YouTubeTranscript" => input
             .get("url")
             .and_then(|v| v.as_str())
             .map(|u| preview(u, 60)),
+        "FetchImages" => input
+            .get("markdown_path")
+            .and_then(|v| v.as_str())
+            .map(|p| preview(p, PREVIEW_CAP)),
         "WebSearch" => input
             .get("query")
             .and_then(|v| v.as_str())
@@ -231,17 +285,27 @@ pub(crate) fn format_tool_heartbeat(label: &str, elapsed: Duration) -> String {
 }
 
 /// Inline spinner line for an active tool — overwrites current line via `\r`.
+/// Truncates or pads the label so the total visible width fits within one
+/// terminal row, preventing line-wrap that breaks `\r` overwrite.
 pub(crate) fn format_tool_spinner(label: &str, elapsed: Duration, tick: u32) -> String {
     let frame = spinner_frame(tick);
     let dur = format_duration(elapsed);
-    format!("\r\x1b[2K\x1b[2m  {frame} {label:<50} {dur}\x1b[0m")
+    let width = terminal_width();
+    // visible layout: "  {frame} {label} {dur}" — 5 fixed chars + dur
+    let label_width = width.saturating_sub(5 + dur.len());
+    let fitted = fit_label(label, label_width);
+    format!("\r\x1b[2K\x1b[2m  {frame} {fitted} {dur}\x1b[0m")
 }
 
 /// Final completion line — clears spinner and writes ✓/✗ with newline.
 pub(crate) fn format_tool_done(label: &str, elapsed: Duration, is_error: bool) -> String {
     let icon = if is_error { '✗' } else { '✓' };
     let dur = format_duration(elapsed);
-    format!("\r\x1b[2K\x1b[2m  {icon} {label:<50} {dur}\x1b[0m\n")
+    let width = terminal_width();
+    // visible layout: "  {icon} {label} {dur}" — 5 fixed chars + dur
+    let label_width = width.saturating_sub(5 + dur.len());
+    let fitted = fit_label(label, label_width);
+    format!("\r\x1b[2K\x1b[2m  {icon} {fitted} {dur}\x1b[0m\n")
 }
 
 /// Inline thinking spinner — overwrites current line with a brightness
@@ -296,7 +360,11 @@ pub(crate) fn clear_thinking_line() -> String {
 /// running. No newline — the matching `format_worker_done` overwrites
 /// this line on completion.
 pub(crate) fn format_worker_start(worker_id: u32, prompt_preview: &str) -> String {
-    let label = truncate(&sanitize_label_field(prompt_preview), 60);
+    let width = terminal_width();
+    // visible: "  ⠋ w{id}  {label}" — 7 fixed chars + id digits
+    let id_len = worker_id.to_string().len();
+    let label_cap = width.saturating_sub(7 + id_len);
+    let label = truncate(&sanitize_label_field(prompt_preview), label_cap);
     format!("\r\x1b[2K\x1b[2m  ⠋ w{worker_id}  {label}\x1b[0m")
 }
 
@@ -311,7 +379,11 @@ pub(crate) fn format_worker_done(
 ) -> String {
     let icon = if is_error { '✗' } else { '✓' };
     let dur = format_duration(elapsed);
-    let label = truncate(&sanitize_label_field(prompt_preview), 60);
+    let width = terminal_width();
+    // visible: "  {icon} w{id}  {label}  {dur}" — 9 fixed chars + id digits + dur
+    let id_len = worker_id.to_string().len();
+    let label_cap = width.saturating_sub(9 + id_len + dur.len());
+    let label = truncate(&sanitize_label_field(prompt_preview), label_cap);
     format!("\r\x1b[2K\x1b[2m  {icon} w{worker_id}  {label}  {dur}\x1b[0m\n")
 }
 
@@ -524,6 +596,17 @@ mod tests {
     }
 
     #[test]
+    fn redact_collapses_home_dir() {
+        let Some(home) = crate::util::home_dir() else {
+            return;
+        };
+        let home = home.to_str().unwrap();
+        let result = redact_secrets(&format!("rm {home}/.ssh/id_rsa"));
+        assert_eq!(result, "rm ~/.ssh/id_rsa");
+        assert!(!result.contains(home));
+    }
+
+    #[test]
     fn redact_json_value_redacts_nested_strings() {
         let redacted = redact_json_value(&json!({
             "command": "curl -H 'Authorization: Bearer sk-123'",
@@ -647,5 +730,21 @@ mod tests {
     fn label_websearch_query() {
         let label = tool_label("WebSearch", &json!({"query": "rust tokio select"}));
         assert_eq!(label, "WebSearch (rust tokio select)");
+    }
+
+    #[test]
+    fn label_extract_flow_tools() {
+        // The /extract side-channel steps must read as progress, not bare
+        // tool names. WebScrape/YouTubeTranscript share WebFetch's url arm;
+        // FetchImages surfaces the markdown path it's downloading images for.
+        let scrape = tool_label("WebScrape", &json!({"url": "https://claude.com/blog/x"}));
+        assert_eq!(scrape, "WebScrape (https://claude.com/blog/x)");
+        let yt = tool_label("YouTubeTranscript", &json!({"url": "https://youtu.be/abc"}));
+        assert_eq!(yt, "YouTubeTranscript (https://youtu.be/abc)");
+        let fetch = tool_label(
+            "FetchImages",
+            &json!({"markdown_path": "articles/loops/article.md"}),
+        );
+        assert_eq!(fetch, "FetchImages (articles/loops/article.md)");
     }
 }

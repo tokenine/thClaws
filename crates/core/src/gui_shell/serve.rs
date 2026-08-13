@@ -139,12 +139,73 @@ pub fn serve_shell_index(shell: &ShellRef, ws_url: &str) -> Response<Body> {
 /// shell renders via `<img src="…/file-asset/output/abc.png">`. Path
 /// is validated via `Sandbox::check_in` rooted at the current
 /// workspace.
-pub fn serve_project_asset(workspace: &std::path::Path, rel: &str) -> Response<Body> {
+/// Read a file-asset honoring an optional HTTP `Range` header. Returns the
+/// body plus `Some((start, end, total))` when a range applied (→ 206). Only
+/// the requested slice is read from disk, and open-ended ranges (`bytes=N-`)
+/// are capped at 8 MB per response — media players see the shorter
+/// Content-Range and keep requesting, which is how progressive buffering
+/// works. Without this, a shell's <video> pulled whole chapter mp4s per
+/// request and playback stuttered.
+pub fn read_asset_maybe_range(
+    path: &std::path::Path,
+    range: Option<&str>,
+) -> std::io::Result<(Vec<u8>, Option<(u64, u64, u64)>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    const OPEN_ENDED_CHUNK: u64 = 8 * 1024 * 1024;
+    let total = std::fs::metadata(path)?.len();
+    let parsed = range
+        .and_then(|h| h.strip_prefix("bytes="))
+        .and_then(|spec| {
+            let (s, e) = spec.split_once('-')?;
+            let start: u64 = s.trim().parse().ok()?;
+            let end: u64 = match e.trim() {
+                "" => (start + OPEN_ENDED_CHUNK - 1).min(total.saturating_sub(1)),
+                v => v.parse::<u64>().ok()?.min(total.saturating_sub(1)),
+            };
+            (start <= end && start < total).then_some((start, end))
+        });
+    match parsed {
+        Some((start, end)) => {
+            let mut f = std::fs::File::open(path)?;
+            f.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; (end - start + 1) as usize];
+            f.read_exact(&mut buf)?;
+            Ok((buf, Some((start, end, total))))
+        }
+        None => Ok((std::fs::read(path)?, None)),
+    }
+}
+
+pub fn serve_project_asset(
+    workspace: &std::path::Path,
+    rel: &str,
+    range: Option<&str>,
+) -> Response<Body> {
     let decoded = match urlencoding::decode(rel) {
         Ok(s) => s.into_owned(),
         Err(_) => rel.to_string(),
     };
-    let resolved = match crate::sandbox::Sandbox::check_in(workspace, &decoded) {
+    // Two callers produce two URL shapes:
+    //   gui-shells (image-batch, video-studio, speech-studio) build
+    //     workspace-relative paths like `images/<slug>/<file>.png` —
+    //     join with cwd → /workspace/images/...
+    //   FilesView's assetUrl builds ABSOLUTE paths like
+    //     /workspace/speech/<file>.wav — axum's Path extractor strips
+    //     the leading `/`, so without the absolute-first attempt we'd
+    //     re-join with cwd and look for /workspace/workspace/... → 404.
+    // Try absolute first (re-add the slash the route capture peeled off);
+    // fall back to workspace-relative. `check_in` enforces sandbox
+    // containment for both — security unchanged.
+    let resolved = {
+        let abs_candidate = if decoded.starts_with('/') {
+            decoded.clone()
+        } else {
+            format!("/{decoded}")
+        };
+        crate::sandbox::Sandbox::check_in(workspace, &abs_candidate)
+            .or_else(|_| crate::sandbox::Sandbox::check_in(workspace, &decoded))
+    };
+    let resolved = match resolved {
         Ok(p) => p,
         Err(_) => {
             return Response::builder()
@@ -153,8 +214,8 @@ pub fn serve_project_asset(workspace: &std::path::Path, rel: &str) -> Response<B
                 .expect("build 403");
         }
     };
-    let bytes = match std::fs::read(&resolved) {
-        Ok(b) => b,
+    let (bytes, range_meta) = match read_asset_maybe_range(&resolved, range) {
+        Ok(v) => v,
         Err(_) => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -163,13 +224,20 @@ pub fn serve_project_asset(workspace: &std::path::Path, rel: &str) -> Response<B
         }
     };
     let mime = mime_for_path(&resolved);
-    Response::builder()
+    let mut rb = Response::builder()
         .header(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap())
+        .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
         .header(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
-        )
-        .body(Body::from(bytes))
+        );
+    if let Some((start, end, total)) = range_meta {
+        rb = rb.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")).unwrap(),
+        );
+    }
+    rb.body(Body::from(bytes))
         .expect("build project-asset response")
 }
 
@@ -195,6 +263,24 @@ fn mime_for_path(path: &std::path::Path) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "txt" | "md" => "text/plain; charset=utf-8",
+        // Inline-renderable in the browser's viewer — without this,
+        // octet-stream makes the Files-tab PDF iframe download instead
+        // of displaying.
+        "pdf" => "application/pdf",
+        // Audio
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "flac" => "audio/flac",
+        "weba" => "audio/webm",
+        // Video
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "ogv" => "video/ogg",
         _ => "application/octet-stream",
     }
 }
@@ -220,6 +306,88 @@ pub fn serve_shell_asset(shell: &ShellRef, rel: &str) -> Response<Body> {
         )
         .body(Body::from(bytes))
         .expect("build asset response")
+}
+
+/// Serve a shell's index.html for the cloud `--serve` mount (Mode C):
+/// React parent loads the shell in an iframe, the bridge runs in
+/// postMessage mode (Mode A) talking to the parent — NOT to a
+/// per-shell WebSocket. So we inline the bridge runtime into the HTML
+/// and skip the Mode B WS-URL injection entirely (no relative-path
+/// games for `/__bridge.js` when the workspace lives under a traefik
+/// strip-prefix).
+pub fn serve_shell_index_inline(shell: &ShellRef) -> Response<Body> {
+    let (bytes, _mime) = match shell.read_asset("index.html") {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("shell entry not readable: {e}")))
+                .expect("build 500");
+        }
+    };
+    let injected = inject_inline_bridge_with_id(&bytes, &shell.manifest().id);
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, must-revalidate"),
+        )
+        .header(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        )
+        .body(Body::from(injected))
+        .expect("build mode-c index response")
+}
+
+/// Inject the bridge runtime as an inline `<script>...</script>` at
+/// the start of `<head>`. No mode globals set → bridge defaults to
+/// Mode A (postMessage), matching the iframe-in-React-parent pattern
+/// UIView uses. Sets `window.__thclaws_shell_id` so the bridge skips
+/// URL-parsing (which would fail in cloud — the iframe path is
+/// `/u/<handle>/<slug>/gui-shell/<id>/...`, traefik strips the prefix
+/// before the engine sees it but the browser's `location.pathname`
+/// includes everything, so `parts[0] === "gui-shell"` is false).
+pub fn inject_inline_bridge_with_id(html: &[u8], shell_id: &str) -> Vec<u8> {
+    let bridge = super::BRIDGE_RUNTIME;
+    let id_json = serde_json::to_string(shell_id)
+        .unwrap_or_else(|_| "\"\"".into())
+        .replace("</", "<\\/");
+    let bridge_safe = bridge.replace("</", "<\\/");
+    let chrome = super::shared_chrome_head();
+    let injection = format!(
+        "<script>window.__thclaws_shell_id={id_json};</script><script>{bridge_safe}</script>{chrome}"
+    );
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = find_subslice(&lower, b"<head>") {
+        let insert_at = idx + b"<head>".len();
+        let mut out = Vec::with_capacity(html.len() + injection.len());
+        out.extend_from_slice(&html[..insert_at]);
+        out.extend_from_slice(injection.as_bytes());
+        out.extend_from_slice(&html[insert_at..]);
+        out
+    } else if let Some(idx) = find_subslice(&lower, b"<head ") {
+        let after_open = html[idx..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| idx + p + 1)
+            .unwrap_or(idx);
+        let mut out = Vec::with_capacity(html.len() + injection.len());
+        out.extend_from_slice(&html[..after_open]);
+        out.extend_from_slice(injection.as_bytes());
+        out.extend_from_slice(&html[after_open..]);
+        out
+    } else {
+        let mut out = Vec::with_capacity(html.len() + injection.len() + b"<head></head>".len());
+        out.extend_from_slice(b"<head>");
+        out.extend_from_slice(injection.as_bytes());
+        out.extend_from_slice(b"</head>");
+        out.extend_from_slice(html);
+        out
+    }
 }
 
 /// Serve the bridge runtime. Identical bytes to what Mode A's protocol
@@ -251,9 +419,9 @@ pub fn inject_mode_b_head_with(
     // but with an extra inline <script> before the bridge.
     let marker = format!(
         "<script>window.__thclaws_shell_mode=\"ws\";window.__thclaws_shell_ws_url={};window.__thclaws_shell_id={};window.__thclaws_shell_session_id={};</script>",
-        serde_json::to_string(ws_url).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::to_string(shell_id).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(ws_url).unwrap_or_else(|_| "\"\"".into()).replace("</", "<\\/"),
+        serde_json::to_string(shell_id).unwrap_or_else(|_| "\"\"".into()).replace("</", "<\\/"),
+        serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".into()).replace("</", "<\\/"),
     );
     let bridge_src = format!(
         "<script src=\"{}/__bridge.js\"></script>",
@@ -261,7 +429,8 @@ pub fn inject_mode_b_head_with(
         // also resolves the bridge asset.
         ws_url.strip_suffix("/__ws").unwrap_or(ws_url)
     );
-    let injection = format!("{marker}{bridge_src}");
+    let chrome = super::shared_chrome_head();
+    let injection = format!("{marker}{bridge_src}{chrome}");
 
     let lower = html.to_ascii_lowercase();
     if let Some(idx) = find_subslice(&lower, b"<head>") {
@@ -373,5 +542,96 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("session-explorer"), "lists installed: {msg}");
         assert!(msg.contains("does-not-exist"));
+    }
+
+    // Regression for PR #157 (@JonusNattapong). JSON escaping doesn't
+    // touch `</`, but the HTML tokenizer scans for the literal byte
+    // sequence `</script>` regardless of JS-level escaping. A
+    // shell-manifest id containing `</script>` (a malicious gui-shell
+    // bundle could plant one) would close the injected `<script>` tag
+    // prematurely and break out. The fix: post-JSON `.replace("</",
+    // "<\\/")` everywhere the value enters a `<script>` body. `<\/`
+    // is invisible to the HTML tokenizer, valid JSON, and equal to
+    // `</` in JS at runtime.
+    #[test]
+    fn inject_inline_bridge_escapes_script_breakout_in_shell_id() {
+        let html = b"<html><head></head><body></body></html>";
+        let evil = "shell</script><script>alert('xss')</script>";
+        let out = inject_inline_bridge_with_id(html, evil);
+        let out_s = std::str::from_utf8(&out).expect("utf8");
+        // Find the injection block — between the first `<script>` we
+        // emitted and the closing `</script>` of the bridge runtime.
+        // The injected shell-id script must contain NO literal
+        // `</script>` between its opening `<script>` and its own
+        // closer; otherwise the HTML parser sees an early close.
+        let first_open = out_s
+            .find("<script>window.__thclaws_shell_id=")
+            .expect("marker");
+        let first_close = out_s[first_open..]
+            .find("</script>")
+            .expect("close")
+            .saturating_add(first_open);
+        let inner = &out_s[first_open + "<script>".len()..first_close];
+        assert!(
+            !inner.contains("</script>"),
+            "shell-id script body contains an early </script>: {inner:?}"
+        );
+        // And the escaped form must be present — sanity check that the
+        // replacement actually happened, not that we accidentally
+        // stripped the attack string entirely.
+        assert!(
+            inner.contains("<\\/script>"),
+            "expected `<\\/script>` in escaped body, got {inner:?}"
+        );
+    }
+
+    #[test]
+    fn inject_mode_b_head_escapes_script_breakout_in_all_values() {
+        let html = b"<html><head></head><body></body></html>";
+        let evil_url = "ws://x/</script><script>1</script>";
+        let evil_id = "id</script>";
+        let evil_session = "sess</script>";
+        let out = inject_mode_b_head_with(html, evil_url, evil_id, evil_session);
+        let out_s = std::str::from_utf8(&out).expect("utf8");
+        let marker_open = out_s
+            .find("<script>window.__thclaws_shell_mode=")
+            .expect("marker");
+        let marker_close = out_s[marker_open..].find("</script>").expect("close") + marker_open;
+        let inner = &out_s[marker_open + "<script>".len()..marker_close];
+        assert!(
+            !inner.contains("</script>"),
+            "mode-b marker body contains an early </script>: {inner:?}"
+        );
+    }
+
+    #[test]
+    fn inline_inject_includes_shared_theme_and_chrome() {
+        let html = b"<html><head></head><body></body></html>";
+        let out = inject_inline_bridge_with_id(html, "demo");
+        let out_s = std::str::from_utf8(&out).expect("utf8");
+        // Shared theme tokens + the <thc-header> component runtime ride
+        // along with the bridge, so studios don't ship their own.
+        assert!(out_s.contains("--accent"), "theme tokens missing");
+        assert!(
+            out_s.contains("customElements.define(\"thc-header\""),
+            "thc-header runtime missing"
+        );
+        // The chrome block must not break out of its own tags: the only
+        // closers present are the single wrapper `</style>` + `</script>`.
+        let chrome = super::super::shared_chrome_head();
+        assert_eq!(chrome.matches("</style>").count(), 1, "early </style>");
+        assert_eq!(chrome.matches("</script>").count(), 1, "early </script>");
+    }
+
+    #[test]
+    fn mode_b_inject_includes_shared_theme_and_chrome() {
+        let html = b"<html><head></head><body></body></html>";
+        let out = inject_mode_b_head_with(html, "/t/x/__ws", "demo", "sess");
+        let out_s = std::str::from_utf8(&out).expect("utf8");
+        assert!(out_s.contains("--accent"), "theme tokens missing");
+        assert!(
+            out_s.contains("customElements.define(\"thc-header\""),
+            "thc-header runtime missing"
+        );
     }
 }

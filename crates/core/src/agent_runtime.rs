@@ -85,6 +85,7 @@ pub async fn build_runtime_with_provider(
     tool_registry.register(Arc::new(crate::tools::KmsReadTool));
     tool_registry.register(Arc::new(crate::tools::KmsSearchTool));
     tool_registry.register(Arc::new(crate::tools::KmsWriteTool));
+    tool_registry.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tool_registry.register(Arc::new(crate::tools::KmsAppendTool));
     tool_registry.register(Arc::new(crate::tools::KmsDeleteTool));
     tool_registry.register(Arc::new(crate::tools::KmsCreateTool));
@@ -125,6 +126,24 @@ pub async fn build_runtime_with_provider(
         config.model.clone(),
         None,
     )));
+
+    // Opt-in native Gemini image tools. Same gating as the
+    // GUI/serve registration in shared_session.rs — settings flag
+    // PLUS env key. Keeps the HTTP API in parity.
+    if config.image_tools_enabled {
+        tool_registry.register(Arc::new(crate::tools::TextToImageTool));
+        tool_registry.register(Arc::new(crate::tools::ImageToImageTool));
+        tool_registry.register(Arc::new(crate::tools::TextToSpeechTool));
+        tool_registry.register(Arc::new(crate::tools::RenderSlidesTool));
+        tool_registry.register(Arc::new(crate::tools::TextToVideoTool));
+        tool_registry.register(Arc::new(crate::tools::ImageToVideoTool));
+        tool_registry.register(Arc::new(crate::tools::MediaJobStatusTool));
+    }
+
+    if config.hal_enabled {
+        tool_registry.register(Arc::new(crate::tools::YouTubeTranscriptTool::new()));
+        tool_registry.register(Arc::new(crate::tools::WebScrapeTool::new()));
+    }
 
     // Team tools deliberately NOT registered for the HTTP API
     // surface — multi-tenant agent_runtime serves untrusted callers,
